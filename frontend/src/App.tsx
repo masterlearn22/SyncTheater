@@ -40,6 +40,7 @@ import {
   Wrench,
   Globe,
   Tv,
+  Zap,
 } from 'lucide-react';
 
 // ============================================================================
@@ -154,6 +155,77 @@ function mungeOpusStereoHighBitrate(sdp: string): string {
   return updated.join('\r\n');
 }
 
+/**
+ * Modifikasi baris SDP Video untuk mengunci batas bandwidth WebRTC ke 4-5 Mbps:
+ * - b=AS:5000 (5000 kbps) & b=TIAS:5000000 (5 Mbps)
+ * - x-google-min-bitrate=2500;x-google-max-bitrate=5000;x-google-start-bitrate=4500
+ */
+function mungeVideoBitrate(sdp: string, targetBitrateKbps = 5000): string {
+  const lines = sdp.split(/\r?\n/);
+  const minKbps = Math.max(1000, Math.floor(targetBitrateKbps * 0.5));
+  const startKbps = Math.max(minKbps, Math.floor(targetBitrateKbps * 0.85));
+  const tiasBps = targetBitrateKbps * 1000;
+
+  let inVideoSection = false;
+  let videoPayloadTypes: string[] = [];
+  const result: string[] = [];
+  let bandwidthInserted = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    if (line.startsWith('m=video ')) {
+      inVideoSection = true;
+      bandwidthInserted = false;
+      const parts = line.split(' ');
+      videoPayloadTypes = parts.slice(3);
+      result.push(line);
+      continue;
+    } else if (line.startsWith('m=audio ') || line.startsWith('m=application ')) {
+      inVideoSection = false;
+    }
+
+    if (inVideoSection) {
+      if (line.startsWith('b=AS:') || line.startsWith('b=TIAS:')) {
+        continue;
+      }
+
+      if (line.startsWith('a=') && !bandwidthInserted) {
+        result.push(`b=AS:${targetBitrateKbps}`);
+        result.push(`b=TIAS:${tiasBps}`);
+        bandwidthInserted = true;
+      }
+
+      let modifiedLine = line;
+      if (line.startsWith('a=fmtp:')) {
+        const fmtpMatch = line.match(/^a=fmtp:(\d+)\s*(.*)$/);
+        if (fmtpMatch && videoPayloadTypes.includes(fmtpMatch[1])) {
+          const pt = fmtpMatch[1];
+          let params = fmtpMatch[2] || '';
+          params = params
+            .split(';')
+            .filter((p) => !p.trim().startsWith('x-google-'))
+            .join(';');
+          const googleBitrate = `x-google-min-bitrate=${minKbps};x-google-max-bitrate=${targetBitrateKbps};x-google-start-bitrate=${startKbps}`;
+          const newParams = params ? `${params};${googleBitrate}` : googleBitrate;
+          modifiedLine = `a=fmtp:${pt} ${newParams}`;
+        }
+      }
+      result.push(modifiedLine);
+    } else {
+      result.push(line);
+    }
+  }
+
+  return result.join('\r\n');
+}
+
+function mungeFullSdp(sdp: string, targetBitrateKbps = 5000): string {
+  let res = mungeOpusStereoHighBitrate(sdp);
+  res = mungeVideoBitrate(res, targetBitrateKbps);
+  return res;
+}
+
 function convertSrtToWebVtt(srtContent: string): {
   vttText: string;
   cues: Array<{ start: number; end: number; text: string }>;
@@ -217,6 +289,16 @@ t=0 0
 m=audio 9 UDP/TLS/RTP/SAVPF 111
 a=rtpmap:111 opus/48000/2
 a=fmtp:111 minptime=10;useinbandfec=1`;
+
+const SAMPLE_VIDEO_SDP_BEFORE = `v=0
+o=- 4611731400430051336 2 IN IP4 127.0.0.1
+s=-
+t=0 0
+m=video 9 UDP/TLS/RTP/SAVPF 96 125
+c=IN IP4 0.0.0.0
+a=rtpmap:96 VP8/90000
+a=rtpmap:125 H264/90000
+a=fmtp:125 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f`;
 
 // ============================================================================
 // 3. KOMPONEN UTAMA SYNCTHEATER (USER-FRIENDLY ROOM + SEPARATED DEV LAB)
@@ -287,6 +369,15 @@ export default function App() {
   const [vttBlobUrl, setVttBlobUrl] = useState<string | null>(null);
   const [vttPreviewText, setVttPreviewText] = useState<string>('');
   const [subtitlesEnabled, setSubtitlesEnabled] = useState<boolean>(true);
+
+  // Pengaturan WebRTC High-Bitrate & Resolusi Tajam (Anti-Burik & Anti-Lag)
+  const [streamBitrateKbps, setStreamBitrateKbps] = useState<number>(5000); // Default 5 Mbps
+  const [streamQualityMode, setStreamQualityMode] = useState<'SHARP' | 'MOTION'>('SHARP'); // 'SHARP' = maintain-resolution
+  const [showBitrateSettings, setShowBitrateSettings] = useState<boolean>(false);
+  const streamBitrateRef = useRef<number>(5000);
+  const streamQualityModeRef = useRef<'SHARP' | 'MOTION'>('SHARP');
+  streamBitrateRef.current = streamBitrateKbps;
+  streamQualityModeRef.current = streamQualityMode;
 
   // State Chat Room & Reaksi Emoji
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
@@ -369,6 +460,119 @@ export default function App() {
     };
     document.head.appendChild(script);
   }, []);
+
+  // Patch global RTCPeerConnection.prototype.setLocalDescription
+  // agar setiap SDP offer/answer yang dibuat PeerJS otomatis membawa konfigurasi High-Bitrate Video (5 Mbps) & Opus Stereo (192k)
+  useEffect(() => {
+    if (typeof window === 'undefined' || !(window as any).RTCPeerConnection) return;
+    const OriginalPC = window.RTCPeerConnection;
+    if ((OriginalPC as any).__synctheater_patched) return;
+    (OriginalPC as any).__synctheater_patched = true;
+
+    const origSetLocal = OriginalPC.prototype.setLocalDescription;
+    OriginalPC.prototype.setLocalDescription = async function (desc?: any) {
+      if (desc && desc.sdp) {
+        try {
+          const targetKbps = streamBitrateRef.current || 5000;
+          const munged = mungeFullSdp(desc.sdp, targetKbps);
+          const newDesc = new RTCSessionDescription({
+            type: desc.type,
+            sdp: munged,
+          });
+          return (origSetLocal as any).call(this, newDesc);
+        } catch (e) {
+          console.warn('[SyncTheater] Gagal munging SDP:', e);
+        }
+      }
+      return (origSetLocal as any).call(this, desc);
+    };
+  }, []);
+
+  // Mengatur RTCRtpSender pada MediaConnection agar bitrate terkunci ke 4-5 Mbps dan anti-burik
+  const setupHighQualityCall = useCallback((call: any) => {
+    if (!call) return;
+    const pc: RTCPeerConnection | undefined = call.peerConnection;
+    if (!pc) return;
+
+    const applyParams = async () => {
+      try {
+        const senders = pc.getSenders();
+        for (const sender of senders) {
+          if (sender.track && sender.track.kind === 'video') {
+            const params = sender.getParameters();
+            if (!params.encodings || params.encodings.length === 0) {
+              params.encodings = [{}];
+            }
+            const currentKbps = streamBitrateRef.current || 5000;
+            const currentMode = streamQualityModeRef.current || 'SHARP';
+            const bitrateBps = currentKbps * 1000;
+
+            for (const enc of params.encodings) {
+              enc.maxBitrate = bitrateBps;
+              (enc as any).minBitrate = Math.min(2500000, bitrateBps);
+              enc.maxFramerate = 60;
+              enc.scaleResolutionDownBy = 1.0;
+            }
+
+            (params as any).degradationPreference =
+              currentMode === 'SHARP' ? 'maintain-resolution' : 'balanced';
+
+            await sender.setParameters(params);
+            console.log(
+              `[SyncTheater WebRTC] Bitrate sender di-set ke ${currentKbps} kbps (${currentMode})`
+            );
+          }
+        }
+      } catch (err) {
+        // abaikan bila belum siap
+      }
+    };
+
+    pc.addEventListener('connectionstatechange', () => {
+      if (pc.connectionState === 'connected' || pc.connectionState === 'connecting') {
+        applyParams();
+      }
+    });
+
+    applyParams();
+    window.setTimeout(applyParams, 300);
+    window.setTimeout(applyParams, 1200);
+    window.setTimeout(applyParams, 3000);
+  }, []);
+
+  const changeStreamBitrate = (newKbps: number) => {
+    setStreamBitrateKbps(newKbps);
+    streamBitrateRef.current = newKbps;
+    if (activeMediaCallRef.current?.peerConnection) {
+      setupHighQualityCall(activeMediaCallRef.current);
+    }
+    appendLog(
+      'ROOM_EVENT',
+      `Bitrate WebRTC diubah ke ${(newKbps / 1000).toFixed(1)} Mbps (${newKbps} kbps)`,
+      'LOCKED_SYNC'
+    );
+    addSystemChat(`Bitrate WebRTC diatur ke ${(newKbps / 1000).toFixed(1)} Mbps`);
+  };
+
+  const changeQualityMode = (mode: 'SHARP' | 'MOTION') => {
+    setStreamQualityMode(mode);
+    streamQualityModeRef.current = mode;
+    if (outgoingMediaStreamRef.current) {
+      outgoingMediaStreamRef.current.getVideoTracks().forEach((track) => {
+        if ('contentHint' in track) {
+          (track as any).contentHint = mode === 'SHARP' ? 'detail' : 'motion';
+        }
+      });
+    }
+    if (activeMediaCallRef.current?.peerConnection) {
+      setupHighQualityCall(activeMediaCallRef.current);
+    }
+    appendLog(
+      'ROOM_EVENT',
+      `Mode WebRTC diubah ke ${mode === 'SHARP' ? 'Resolusi Tajam (Anti-Burik)' : 'Gerakan Mulus (60 FPS)'}`,
+      'LOCKED_SYNC'
+    );
+  };
 
   // Tempelkan MediaStream jarak jauh ke elemen <video> saat terpasang (khususnya di browser HP)
   useEffect(() => {
@@ -465,13 +669,21 @@ export default function App() {
             });
             guestPeer.on('call', (call: any) => {
               call.answer();
-              // Turunkan jitter buffer receiver ke 50ms agar delay berkurang drastis
+              // Optimasi jitter buffer receiver ke 180ms agar 1080p 5 Mbps lancar tanpa stutter di Wi-Fi
               try {
                 const pc: RTCPeerConnection | undefined = call.peerConnection;
                 if (pc) {
-                  pc.getReceivers().forEach((receiver: any) => {
-                    if ('playoutDelayHint' in receiver) {
-                      receiver.playoutDelayHint = 0.05;
+                  const setReceiverDelay = () => {
+                    pc.getReceivers().forEach((receiver: any) => {
+                      if ('playoutDelayHint' in receiver) {
+                        receiver.playoutDelayHint = 0.18;
+                      }
+                    });
+                  };
+                  setReceiverDelay();
+                  pc.addEventListener('track', (e) => {
+                    if (e.receiver && 'playoutDelayHint' in e.receiver) {
+                      e.receiver.playoutDelayHint = 0.18;
                     }
                   });
                 }
@@ -483,8 +695,8 @@ export default function App() {
                   remoteMediaStreamRef.current = remoteStream;
                   setHasRemoteVideoStream(true);
                   setIsPlaying(true);
-                  setLocalVideoName('Live Stream dari Host (WebRTC P2P)');
-                  addSystemChat('Menerima siaran film langsung dari Host!');
+                  setLocalVideoName('Live Stream dari Host (WebRTC 5 Mbps Full HD)');
+                  addSystemChat('Menerima siaran film lancar (5 Mbps High-Bitrate) langsung dari Host!');
                 }
               });
             });
@@ -548,10 +760,12 @@ export default function App() {
       if (data.guestPeerId) {
         connectedGuestPeerIdRef.current = data.guestPeerId;
         if (outgoingMediaStreamRef.current && peerInstanceRef.current) {
-          activeMediaCallRef.current = peerInstanceRef.current.call(
+          const call = peerInstanceRef.current.call(
             data.guestPeerId,
             outgoingMediaStreamRef.current
           );
+          activeMediaCallRef.current = call;
+          setupHighQualityCall(call);
         }
       }
       addSystemChat(`${data.sender || 'Pasangan'} baru saja bergabung ke Room!`);
@@ -565,10 +779,10 @@ export default function App() {
   };
 
   const pushStreamToConnectedGuest = (stream: MediaStream, label: string) => {
-    // Tandai track video sebagai 'motion' agar encoder WebRTC memprioritaskan kelancaran frame rate
+    // Mode SHARP ('detail') mengunci resolusi tajam 1080p agar anti-burik (tidak downscale ke 360p)
     stream.getVideoTracks().forEach((track) => {
       if ('contentHint' in track) {
-        (track as any).contentHint = 'motion';
+        (track as any).contentHint = streamQualityModeRef.current === 'SHARP' ? 'detail' : 'motion';
       }
     });
     outgoingMediaStreamRef.current = stream;
@@ -577,14 +791,16 @@ export default function App() {
 
     if (peerInstanceRef.current && connectedGuestPeerIdRef.current) {
       activeMediaCallRef.current?.close?.();
-      activeMediaCallRef.current = peerInstanceRef.current.call(
+      const call = peerInstanceRef.current.call(
         connectedGuestPeerIdRef.current,
         stream
       );
-      addSystemChat(`Mulai menyiarkan "${label}" ke pasangan!`);
+      activeMediaCallRef.current = call;
+      setupHighQualityCall(call);
+      addSystemChat(`Mulai menyiarkan "${label}" (WebRTC ${(streamBitrateRef.current / 1000).toFixed(1)} Mbps) ke pasangan!`);
     } else {
       addSystemChat(
-        `Siaran "${label}" siap! Pasangan akan otomatis menonton begitu masuk ke Room.`
+        `Siaran "${label}" (${(streamBitrateRef.current / 1000).toFixed(1)} Mbps) siap! Pasangan akan otomatis menonton begitu masuk ke Room.`
       );
     }
   };
@@ -595,9 +811,9 @@ export default function App() {
     let captured: MediaStream | null = null;
 
     if (localVideoUrl && vid) {
-      captured = vid.captureStream ? vid.captureStream(30) : vid.mozCaptureStream?.(30);
+      captured = vid.captureStream ? vid.captureStream(60) : vid.mozCaptureStream?.(60);
     } else if (canvas) {
-      captured = canvas.captureStream ? canvas.captureStream(30) : null;
+      captured = canvas.captureStream ? canvas.captureStream(60) : null;
     }
 
     if (captured) {
@@ -610,11 +826,16 @@ export default function App() {
   const startScreenShareToPartner = async () => {
     try {
       const screenStream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: { ideal: 60, max: 60 } },
+        video: {
+          width: { ideal: 1920, max: 1920 },
+          height: { ideal: 1080, max: 1080 },
+          frameRate: { ideal: 60, max: 60 },
+        },
         audio: {
           echoCancellation: false,
           noiseSuppression: false,
           autoGainControl: false,
+          channelCount: 2,
         } as MediaTrackConstraints,
       });
 
@@ -627,7 +848,7 @@ export default function App() {
         videoRef.current.play().catch(() => {});
       }
       setHasRemoteVideoStream(true);
-      setLocalVideoName('Share Layar / Tab Host');
+      setLocalVideoName('Share Layar / Tab Host (Full HD 60fps)');
       pushStreamToConnectedGuest(screenStream, 'Tab / Layar Laptop Host');
     } catch {
       addSystemChat('Share layar dibatalkan oleh pengguna.');
@@ -1670,6 +1891,106 @@ export default function App() {
                     </div>
 
                     <div className="flex flex-wrap items-center gap-2">
+                      {/* Pengaturan Bitrate & Anti-Burik WebRTC */}
+                      <div className="relative">
+                        <button
+                          type="button"
+                          onClick={() => setShowBitrateSettings((v) => !v)}
+                          className={`px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition border ${
+                            streamBitrateKbps >= 4500
+                              ? 'bg-amber-500/15 border-amber-500/40 text-amber-300 hover:bg-amber-500/25'
+                              : 'bg-zinc-900 border-zinc-700 text-zinc-300 hover:bg-zinc-800'
+                          }`}
+                          title="Atur Bitrate WebRTC (4-5 Mbps) & Mode Anti-Burik"
+                        >
+                          <Zap className="w-3.5 h-3.5 text-amber-400" />
+                          <span>{(streamBitrateKbps / 1000).toFixed(1)} Mbps ({streamQualityMode === 'SHARP' ? 'Anti-Burik' : '60 FPS'})</span>
+                          <Sliders className="w-3 h-3 opacity-60" />
+                        </button>
+
+                        {showBitrateSettings && (
+                          <div className="absolute bottom-full right-0 mb-2 w-80 rounded-2xl bg-[#18181B] border border-zinc-700/80 shadow-2xl p-4 z-50 space-y-3.5 text-xs">
+                            <div className="flex items-center justify-between pb-2 border-b border-zinc-800">
+                              <div className="flex items-center gap-1.5">
+                                <Zap className="w-4 h-4 text-amber-400" />
+                                <span className="font-bold text-white">Kualitas & Bitrate WebRTC</span>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => setShowBitrateSettings(false)}
+                                className="text-[11px] text-zinc-400 hover:text-white"
+                              >
+                                Tutup
+                              </button>
+                            </div>
+
+                            <div className="space-y-1.5">
+                              <label className="text-[11px] font-medium text-zinc-400">
+                                Target Bitrate Video:
+                              </label>
+                              <div className="grid grid-cols-2 gap-1.5">
+                                {[
+                                  { label: '5.0 Mbps (Rekomendasi)', kbps: 5000, desc: 'Full HD Tajam & Halus' },
+                                  { label: '4.0 Mbps (Lancar)', kbps: 4000, desc: 'Stabil 1080p' },
+                                  { label: '2.5 Mbps (Hemat)', kbps: 2500, desc: 'Untuk Kuota Terbatas' },
+                                  { label: '8.0 Mbps (Ultra HD)', kbps: 8000, desc: 'Kualitas Bioskop Max' },
+                                ].map((item) => (
+                                  <button
+                                    key={item.kbps}
+                                    type="button"
+                                    onClick={() => changeStreamBitrate(item.kbps)}
+                                    className={`p-2 rounded-xl text-left border transition ${
+                                      streamBitrateKbps === item.kbps
+                                        ? 'bg-amber-500/20 border-amber-500/60 text-amber-200 font-semibold'
+                                        : 'bg-zinc-900 border-zinc-800 text-zinc-300 hover:bg-zinc-850'
+                                    }`}
+                                  >
+                                    <div className="text-[11px] font-bold">{item.label}</div>
+                                    <div className="text-[10px] text-zinc-400">{item.desc}</div>
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+
+                            <div className="space-y-1.5">
+                              <label className="text-[11px] font-medium text-zinc-400">
+                                Prioritas Mode Degradasi (Anti-Burik):
+                              </label>
+                              <div className="grid grid-cols-2 gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() => changeQualityMode('SHARP')}
+                                  className={`p-2 rounded-xl text-left border transition ${
+                                    streamQualityMode === 'SHARP'
+                                      ? 'bg-indigo-600/25 border-indigo-500/60 text-indigo-200 font-semibold'
+                                      : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                                  }`}
+                                >
+                                  <div className="text-[11px] font-bold">🎬 Resolusi Tajam</div>
+                                  <div className="text-[10px] text-zinc-400">Kunci 1080p, tolak burik</div>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => changeQualityMode('MOTION')}
+                                  className={`p-2 rounded-xl text-left border transition ${
+                                    streamQualityMode === 'MOTION'
+                                      ? 'bg-emerald-600/25 border-emerald-500/60 text-emerald-200 font-semibold'
+                                      : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                                  }`}
+                                >
+                                  <div className="text-[11px] font-bold">🏃 Gerakan 60 FPS</div>
+                                  <div className="text-[10px] text-zinc-400">Prioritaskan kehalusan</div>
+                                </button>
+                              </div>
+                            </div>
+
+                            <div className="p-2.5 rounded-xl bg-zinc-950 border border-zinc-850 text-[10px] text-zinc-400 leading-relaxed">
+                              💡 <strong>Tips Anti-Lag:</strong> Bitrate 4-5 Mbps dipadukan dengan Jitter Buffer 180ms menjamin video 1080p tetap jernih tanpa macet di jaringan Wi-Fi.
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
                       {role === 'HOST' && (
                         <>
                           {isHostStreaming ? (
@@ -2119,8 +2440,26 @@ git push -u origin main`}
           {devTab === 'SDP_CONSOLE' && (
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               <div className="rounded-2xl border border-zinc-800 bg-[#18181B] p-6 space-y-3">
-                <h3 className="text-sm font-bold text-white">
-                  SDP Munging Opus Stereo 192 kbps CBR
+                <h3 className="text-sm font-bold text-white flex items-center justify-between">
+                  <span>SDP Munging Video 5.0 Mbps (Anti-Burik)</span>
+                  <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 font-mono">
+                    b=AS:5000 • 5000 kbps
+                  </span>
+                </h3>
+                <pre className="p-3 rounded-xl bg-zinc-950 border border-zinc-800 text-[11px] font-mono text-zinc-400 overflow-x-auto">
+                  {SAMPLE_VIDEO_SDP_BEFORE}
+                </pre>
+                <pre className="p-3 rounded-xl bg-zinc-950 border border-amber-500/40 text-[11px] font-mono text-amber-300 overflow-x-auto">
+                  {mungeVideoBitrate(SAMPLE_VIDEO_SDP_BEFORE, 5000)}
+                </pre>
+              </div>
+
+              <div className="rounded-2xl border border-zinc-800 bg-[#18181B] p-6 space-y-3">
+                <h3 className="text-sm font-bold text-white flex items-center justify-between">
+                  <span>SDP Munging Opus Stereo 192 kbps CBR</span>
+                  <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-mono">
+                    maxaveragebitrate=192000
+                  </span>
                 </h3>
                 <pre className="p-3 rounded-xl bg-zinc-950 border border-zinc-800 text-[11px] font-mono text-zinc-400 overflow-x-auto">
                   {SAMPLE_SDP_BEFORE}
@@ -2130,14 +2469,14 @@ git push -u origin main`}
                 </pre>
               </div>
 
-              <div className="rounded-2xl border border-zinc-800 bg-[#18181B] p-6 space-y-3">
+              <div className="lg:col-span-2 rounded-2xl border border-zinc-800 bg-[#18181B] p-6 space-y-3">
                 <h3 className="text-sm font-bold text-white">
                   Konverter Subtitle .SRT ke WebVTT (.VTT)
                 </h3>
                 <textarea
                   value={srtRawText}
                   onChange={(e) => setSrtRawText(e.target.value)}
-                  rows={5}
+                  rows={4}
                   className="w-full p-3 rounded-xl bg-zinc-950 border border-zinc-800 text-[11px] font-mono text-zinc-200"
                 />
                 <pre className="p-3 rounded-xl bg-zinc-950 border border-indigo-500/30 text-[11px] font-mono text-indigo-300 max-h-40 overflow-auto">

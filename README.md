@@ -1,4 +1,4 @@
-# SyncTheater (`nobar-sync`) — Aplikasi Nobar Real-Time Anti-Lag
+<!--  --># SyncTheater (`nobar-sync`) — Aplikasi Nobar Real-Time Anti-Lag
 
 Implementasi lengkap arsitektur **Laptop-as-Host Single-Binary Server** untuk menonton film bersama secara *real-time* dalam kualitas asli (`1080p`/`4K`) tanpa layar hitam DRM, tanpa *re-encoding lag*, dan dilengkapi suara obrolan jernih berfitur *Auto-Ducking*.
 
@@ -33,6 +33,26 @@ nobar-sync/
     ├── prep-movie.sh           # Skrip FFmpeg remux cepat untuk Linux/macOS
     └── prep-movie.bat          # Skrip FFmpeg remux cepat untuk Windows
 ```
+
+## Fitur Unggulan WebRTC High-Bitrate & Anti-Burik (4 - 5 Mbps)
+
+Untuk mode **Screen Share** dan **Live Stream P2P**, sistem kini telah dioptimalkan secara mendalam:
+1. **Bitrate Video WebRTC Dikunci ke 4-5 Mbps (4000 - 5000 kbps)**: Mengatasi bitrate bawaan browser yang biasanya hanya 1 - 1.5 Mbps.
+2. **SDP Munging Bandwidth (b=AS:5000 & b=TIAS:5000000)**: Memaksa encoder browser (Chrome/Edge/Firefox) mengalokasikan bitrate tinggi sejak detik pertama (`x-google-start-bitrate=4500`).
+3. **Anti-Burik (maintain-resolution & contentHint='detail')**: Mencegah browser menurunkan resolusi video ke 360p/480p saat mendeteksi gerakan atau fluktuasi jaringan.
+4. **Jitter Buffer Anti-Stutter (180ms playoutDelayHint)**: Mencegah video tersendat atau *freeze* akibat jitter paket data di jaringan Wi-Fi/Internet rumah.
+5. **Selector Kualitas & Bitrate Interaktif**: Terdapat tombol pengatur bitrate langsung di layar nobar (2.5 Mbps, 4.0 Mbps, 5.0 Mbps, hingga 8.0 Mbps) serta pilihan mode *Resolusi Tajam* vs *Gerakan 60 FPS*.
+
+---
+
+## 2 Cara Nobar di SyncTheater (Pilih yang Paling Cocok):
+
+| Mode | Cara Kerja | Kualitas Video | Beban Jaringan & Lag |
+| :--- | :--- | :--- | :--- |
+| **Mode 1: Direct File / HTTP 206 (Sangat Direkomendasikan)** | Host & Pasangan sama-sama memilih file film `.mp4` lokal (atau stream via `nobar.exe` + Cloudflare). Mesin `SyncEngine` menyamakan detik film secara otomatis. | **100% Kualitas Asli Film (1080p/4K bitrate 10-20 Mbps)** | **0% Lag / 0% Burik** (tidak ada re-encode, kuota sangat hemat karena video di-buffer secara lokal). |
+| **Mode 2: WebRTC Screen Share (Stream Film Ini)** | Host menangkap tab/layar dan mentransmisikannya lewat WebRTC P2P ke browser pasangan. | **Full HD Tajam (Bitrate 4 - 5 Mbps)** | Butuh koneksi internet stabil (upload Host minimal 6-10 Mbps). Cocok jika pasangan tidak memiliki file film di HP/laptopnya. |
+
+---
 
 ## Cara Build Menjadi Single Binary (`nobar.exe` / `nobar`)
 

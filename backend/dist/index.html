@@ -1,122 +1,13 @@
 <!doctype html>
 <html lang="id" class="dark">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>SyncTheater — Aplikasi Nobar Real-Time Anti-Lag</title>
-  <script src="https://cdn.tailwindcss.com/3.4.15"></script>
-</head>
-<body class="bg-[#09090B] text-zinc-100 min-h-screen flex flex-col">
-  <header class="border-b border-zinc-800 bg-[#18181B]/80 px-6 py-3 flex items-center justify-between">
-    <div class="flex items-center gap-3">
-      <div class="w-8 h-8 rounded-xl bg-indigo-600 flex items-center justify-center font-bold">ST</div>
-      <div>
-        <h1 class="text-sm font-bold">SyncTheater — HTTP 206 Range Stream + NTP-Lite + WebRTC</h1>
-        <p class="text-xs text-zinc-400">Single-Binary Server Aktif</p>
-      </div>
-    </div>
-    <div class="flex gap-2">
-      <button id="btnHost" class="px-3 py-1 rounded bg-indigo-600 text-xs font-semibold">HOST</button>
-      <button id="btnGuest" class="px-3 py-1 rounded bg-zinc-800 text-xs font-semibold">GUEST</button>
-    </div>
-  </header>
-  <main class="max-w-6xl w-full mx-auto p-6 grid grid-cols-1 lg:grid-cols-3 gap-6 flex-1">
-    <div class="lg:col-span-2 space-y-3">
-      <div class="relative aspect-video bg-black rounded-2xl overflow-hidden border border-zinc-800">
-        <video id="player" class="w-full h-full object-contain" controls playsinline crossorigin="anonymous">
-          <track id="subTrack" kind="subtitles" srclang="id" label="Indonesia" default />
-        </video>
-      </div>
-      <div id="syncBadge" class="text-xs font-mono text-zinc-400 bg-[#18181B] border border-zinc-800 rounded-xl p-3">
-        Menghubungkan ke WebSocket Hub (/ws)...
-      </div>
-    </div>
-    <div class="space-y-4">
-      <div class="rounded-xl border border-zinc-800 bg-[#18181B] p-4 space-y-2">
-        <h2 class="text-xs font-bold uppercase text-zinc-300">Daftar Film di Folder Server</h2>
-        <div id="movieList" class="space-y-1.5 text-xs text-zinc-400">Memuat daftar film...</div>
-      </div>
-      <div class="rounded-xl border border-zinc-800 bg-[#18181B] p-4 space-y-2">
-        <h2 class="text-xs font-bold uppercase text-zinc-300">Konverter Subtitle .SRT ke .VTT</h2>
-        <input id="srtInput" type="file" accept=".srt,.vtt" class="text-xs text-zinc-300" />
-      </div>
-    </div>
-  </main>
-  <script>
-    const video = document.getElementById('player');
-    const badge = document.getElementById('syncBadge');
-    let role = 'HOST';
-    let clockOffset = 0;
-    let isSoftCorrecting = false;
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(proto + '//' + location.host + '/ws?room=cinema-1&role=' + role);
-
-    ws.onopen = () => {
-      badge.textContent = 'Terhubung ke WebSocket Hub • Mengirim 5 paket PING NTP-Lite...';
-      for (let i = 1; i <= 5; i++) {
-        setTimeout(() => ws.send(JSON.stringify({ type: 'PING', seq: i, clientSentTime: Date.now() })), i * 150);
-      }
-    };
-
-    ws.onmessage = (ev) => {
-      const msg = JSON.parse(ev.data);
-      if (msg.type === 'PONG') {
-        const now = Date.now();
-        const rtt = Math.max(1, now - msg.clientSentTime);
-        clockOffset = (msg.serverTimestamp + rtt / 2) - now;
-        badge.textContent = 'NTP-Lite Terkalibrasi | RTT: ' + rtt + 'ms | Offset: ' + Math.round(clockOffset) + 'ms';
-      } else if (msg.type === 'SYNC_STATE') {
-        if (msg.action === 'MEDIA_CHANGE' && msg.mediaSource) {
-          video.src = msg.mediaSource;
-          return;
-        }
-        const transit = (Date.now() - msg.serverTimestamp + clockOffset) / 1000;
-        const target = msg.videoTime + Math.max(0, transit);
-        const delta = target - video.currentTime;
-        const abs = Math.abs(delta);
-        if (abs > 1.0) {
-          video.currentTime = target;
-          video.playbackRate = 1.0;
-          isSoftCorrecting = false;
-        } else if (abs >= (isSoftCorrecting ? 0.03 : 0.05)) {
-          video.playbackRate = delta > 0 ? 1.04 : 0.96;
-          isSoftCorrecting = true;
-        } else {
-          video.playbackRate = 1.0;
-          isSoftCorrecting = false;
-        }
-      }
-    };
-
-    fetch('/api/movies').then(r => r.json()).then(data => {
-      const box = document.getElementById('movieList');
-      if (!data.movies || !data.movies.length) {
-        box.textContent = 'Belum ada file .mp4/.webm di folder --media-dir';
-        return;
-      }
-      box.innerHTML = '';
-      data.movies.forEach(m => {
-        const btn = document.createElement('button');
-        btn.className = 'w-full text-left px-3 py-2 rounded bg-zinc-900 hover:bg-indigo-600/20 border border-zinc-800';
-        btn.textContent = m.name;
-        btn.onclick = () => {
-          video.src = m.streamUrl;
-          ws.send(JSON.stringify({ type: 'SYNC_STATE', action: 'MEDIA_CHANGE', mediaSource: m.streamUrl, videoTime: 0 }));
-        };
-        box.appendChild(btn);
-      });
-    });
-
-    document.getElementById('srtInput').onchange = (e) => {
-      const f = e.target.files[0];
-      if (!f) return;
-      const reader = new FileReader();
-      reader.onload = () => {
-        const vtt = 'WEBVTT\n\n' + String(reader.result).replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
-        document.getElementById('subTrack').src = URL.createObjectURL(new Blob([vtt], { type: 'text/vtt' }));
-      };
-      reader.readAsText(f);
-    };
-  </script>
-</body>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SyncTheater — Aplikasi Nobar Real-Time Anti-Lag</title>
+    <script type="module" crossorigin src="/assets/index-Tq8f6fsR.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-22_8WzSL.css">
+  </head>
+  <body class="bg-[#09090B] text-zinc-100 antialiased selection:bg-indigo-500 selection:text-white overflow-x-hidden">
+    <div id="root"></div>
+  </body>
 </html>
