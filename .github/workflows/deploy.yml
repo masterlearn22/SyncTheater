@@ -33,6 +33,7 @@ jobs:
         working-directory: ./frontend
         run: |
           npm install
+          chmod -R +x node_modules/.bin || true
           npx vite build --base="./" --outDir dist
 
       - name: Upload Pages artifact
