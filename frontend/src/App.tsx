@@ -327,6 +327,8 @@ export default function App() {
   const [isHostStreaming, setIsHostStreaming] = useState<boolean>(false);
   const [streamingSourceLabel, setStreamingSourceLabel] = useState<string>('');
   const [hasRemoteVideoStream, setHasRemoteVideoStream] = useState<boolean>(false);
+  const remoteMediaStreamRef = useRef<MediaStream | null>(null);
+  const [autoplayBlocked, setAutoplayBlocked] = useState<boolean>(false);
 
   const appendLog = useCallback((action: SyncLogItem['action'], detail: string, zone: SyncZone) => {
     const nowStr = new Date().toTimeString().slice(0, 8);
@@ -367,6 +369,21 @@ export default function App() {
     };
     document.head.appendChild(script);
   }, []);
+
+  // Tempelkan MediaStream jarak jauh ke elemen <video> saat terpasang (khususnya di browser HP)
+  useEffect(() => {
+    if (hasRemoteVideoStream && remoteMediaStreamRef.current && videoRef.current) {
+      const vid = videoRef.current;
+      if (vid.srcObject !== remoteMediaStreamRef.current) {
+        vid.srcObject = remoteMediaStreamRef.current;
+      }
+      vid.play().then(() => {
+        setAutoplayBlocked(false);
+      }).catch(() => {
+        setAutoplayBlocked(true);
+      });
+    }
+  }, [hasRemoteVideoStream, inRoom]);
 
   // Konversi Subtitle .SRT ke .VTT
   useEffect(() => {
@@ -448,16 +465,25 @@ export default function App() {
             });
             guestPeer.on('call', (call: any) => {
               call.answer();
+              // Turunkan jitter buffer receiver ke 50ms agar delay berkurang drastis
+              try {
+                const pc: RTCPeerConnection | undefined = call.peerConnection;
+                if (pc) {
+                  pc.getReceivers().forEach((receiver: any) => {
+                    if ('playoutDelayHint' in receiver) {
+                      receiver.playoutDelayHint = 0.05;
+                    }
+                  });
+                }
+              } catch {
+                // abaikan jika browser tidak mendukung playoutDelayHint
+              }
               call.on('stream', (remoteStream: MediaStream) => {
                 if (remoteStream.getVideoTracks().length > 0) {
+                  remoteMediaStreamRef.current = remoteStream;
                   setHasRemoteVideoStream(true);
+                  setIsPlaying(true);
                   setLocalVideoName('Live Stream dari Host (WebRTC P2P)');
-                  window.setTimeout(() => {
-                    if (videoRef.current) {
-                      videoRef.current.srcObject = remoteStream;
-                      videoRef.current.play().catch(() => {});
-                    }
-                  }, 100);
                   addSystemChat('Menerima siaran film langsung dari Host!');
                 }
               });
@@ -494,16 +520,24 @@ export default function App() {
 
   const handleIncomingRoomPacket = (data: any) => {
     if (data.type === 'SYNC_ACTION') {
+      const vid = videoRef.current;
+      const hasMedia = Boolean(vid && (vid.src || vid.srcObject));
       if (data.action === 'PLAY') {
         setIsPlaying(true);
-        if (videoRef.current && localVideoUrl) videoRef.current.play().catch(() => {});
+        if (vid && hasMedia) {
+          vid.play().then(() => setAutoplayBlocked(false)).catch(() => setAutoplayBlocked(true));
+        }
       } else if (data.action === 'PAUSE') {
         setIsPlaying(false);
-        if (videoRef.current && localVideoUrl) videoRef.current.pause();
+        if (vid && hasMedia) {
+          vid.pause();
+        }
       } else if (data.action === 'SEEK' && typeof data.videoTime === 'number') {
         setHostTime(data.videoTime);
         setClientTime(data.videoTime);
-        if (videoRef.current && localVideoUrl) videoRef.current.currentTime = data.videoTime;
+        if (vid && vid.src && !vid.srcObject) {
+          vid.currentTime = data.videoTime;
+        }
       }
     } else if (data.type === 'CHAT_MSG') {
       setChatMessages((prev) => [...prev, data.message]);
@@ -531,6 +565,12 @@ export default function App() {
   };
 
   const pushStreamToConnectedGuest = (stream: MediaStream, label: string) => {
+    // Tandai track video sebagai 'motion' agar encoder WebRTC memprioritaskan kelancaran frame rate
+    stream.getVideoTracks().forEach((track) => {
+      if ('contentHint' in track) {
+        (track as any).contentHint = 'motion';
+      }
+    });
     outgoingMediaStreamRef.current = stream;
     setIsHostStreaming(true);
     setStreamingSourceLabel(label);
@@ -811,9 +851,12 @@ export default function App() {
     setPlayActionFeedback(next ? 'PLAY' : 'PAUSE');
     window.setTimeout(() => setPlayActionFeedback(null), 650);
 
-    if (videoRef.current && localVideoUrl) {
-      if (next) videoRef.current.play().catch(() => {});
-      else videoRef.current.pause();
+    if (videoRef.current && (videoRef.current.src || videoRef.current.srcObject)) {
+      if (next) {
+        videoRef.current.play().then(() => setAutoplayBlocked(false)).catch(() => setAutoplayBlocked(true));
+      } else {
+        videoRef.current.pause();
+      }
     }
 
     broadcastRoomPacket({
@@ -938,6 +981,7 @@ export default function App() {
   };
 
   const formatTime = (sec: number) => {
+    if (!Number.isFinite(sec) || sec < 0) return 'LIVE';
     const mins = Math.floor(sec / 60);
     const secs = Math.floor(sec % 60);
     return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
@@ -1339,6 +1383,7 @@ export default function App() {
                           src={localVideoUrl || undefined}
                           onClick={handleTogglePlayPause}
                           className="w-full h-full object-contain bg-black cursor-pointer"
+                          autoPlay
                           playsInline
                           onTimeUpdate={() => {
                             if (videoRef.current) {
@@ -1347,7 +1392,11 @@ export default function App() {
                             }
                           }}
                           onLoadedMetadata={() => {
-                            if (videoRef.current && videoRef.current.duration) {
+                            if (
+                              videoRef.current &&
+                              Number.isFinite(videoRef.current.duration) &&
+                              videoRef.current.duration > 0
+                            ) {
                               setDuration(videoRef.current.duration);
                             }
                           }}
@@ -1370,6 +1419,37 @@ export default function App() {
                           onClick={handleTogglePlayPause}
                           className="w-full h-full object-cover cursor-pointer"
                         />
+                      )}
+
+                      {/* Tombol Buka Blokir Autoplay Browser HP (Khusus Guest penerima Live Stream) */}
+                      {autoplayBlocked && hasRemoteVideoStream && (
+                        <div className="absolute inset-0 z-20 bg-black/80 backdrop-blur-sm flex flex-col items-center justify-center p-4 text-center space-y-3">
+                          <p className="text-xs sm:text-sm text-zinc-200 max-w-xs">
+                            Browser HP menahan putar otomatis bersuara. Ketuk tombol di bawah untuk menampilkan film dari Host:
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (videoRef.current) {
+                                videoRef.current.muted = false;
+                                videoRef.current.play().then(() => {
+                                  setAutoplayBlocked(false);
+                                  setIsPlaying(true);
+                                }).catch(() => {
+                                  if (videoRef.current) {
+                                    videoRef.current.muted = true;
+                                    videoRef.current.play().catch(() => {});
+                                    setAutoplayBlocked(false);
+                                  }
+                                });
+                              }
+                            }}
+                            className="px-5 py-3 rounded-2xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-sm shadow-xl flex items-center gap-2 transition"
+                          >
+                            <Play className="w-5 h-5" />
+                            <span>Ketuk untuk Putar Siaran Film</span>
+                          </button>
+                        </div>
                       )}
 
                       {/* Animasi Ikon Klik Play/Pause di Tengah Layar */}
@@ -1477,7 +1557,9 @@ export default function App() {
                               </button>
 
                               <span className="text-xs font-mono text-zinc-200 ml-1">
-                                {formatTime(clientTime)} / {formatTime(duration)}
+                                {hasRemoteVideoStream && !localVideoUrl
+                                  ? `${formatTime(clientTime)} • LIVE STREAM`
+                                  : `${formatTime(clientTime)} / ${formatTime(duration)}`}
                               </span>
                             </div>
 
