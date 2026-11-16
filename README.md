@@ -67,4 +67,3 @@ nobar-sync/
    cloudflared tunnel --url http://localhost:8080
    ```
    Salin tautan `https://*.trycloudflare.com` yang muncul di Terminal 2 dan kirimkan ke pasangan.
-"# SyncTheater" 
