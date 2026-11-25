@@ -90,20 +90,27 @@ func (h *RoomHub) Run() {
 				h.Rooms[client.RoomID] = room
 			}
 			room.Clients[client] = true
+			var initialState *SyncState
+			if room.LastState != nil {
+				copied := *room.LastState
+				initialState = &copied
+			}
 			h.mu.Unlock()
 
 			log.Printf("[Hub] Client bergabung ke room '%s' sebagai %s (PeerID: %s)", client.RoomID, client.Role, client.PeerID)
 
 			// Kirim state terakhir ke klien yang baru bergabung / refresh
-			if room.LastState != nil {
-				stateCopy := *room.LastState
-				if stateCopy.IsPlaying {
-					elapsedSec := float64(time.Now().UnixMilli()-stateCopy.ServerTimestamp) / 1000.0
-					stateCopy.VideoTime += elapsedSec * stateCopy.PlaybackRate
-					stateCopy.ServerTimestamp = time.Now().UnixMilli()
+			if initialState != nil {
+				if initialState.IsPlaying {
+					elapsedSec := float64(time.Now().UnixMilli()-initialState.ServerTimestamp) / 1000.0
+					initialState.VideoTime += elapsedSec * initialState.PlaybackRate
+					initialState.ServerTimestamp = time.Now().UnixMilli()
 				}
-				if raw, err := json.Marshal(stateCopy); err == nil {
-					client.Send <- raw
+				if raw, err := json.Marshal(initialState); err == nil {
+					select {
+					case client.Send <- raw:
+					default:
+					}
 				}
 			}
 

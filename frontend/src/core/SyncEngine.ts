@@ -224,12 +224,29 @@ export class SyncEngine {
       if (this.videoElement.paused) {
         this.videoElement.play().catch(() => {});
       }
+    } else if (state.action === 'HEARTBEAT') {
+      if (state.isPlaying === false) {
+        if (!this.videoElement.paused) {
+          this.videoElement.pause();
+        }
+        this.videoElement.playbackRate = 1.0;
+        this.isSoftCorrecting = false;
+        return;
+      }
+      if (state.isPlaying === true && this.videoElement.paused) {
+        this.videoElement.play().catch(() => {});
+      }
     }
 
     if (state.action === 'SEEK') {
       this.videoElement.currentTime = targetTime;
       this.videoElement.playbackRate = 1.0;
       this.isSoftCorrecting = false;
+      if (state.isPlaying === false && !this.videoElement.paused) {
+        this.videoElement.pause();
+      } else if (state.isPlaying === true && this.videoElement.paused) {
+        this.videoElement.play().catch(() => {});
+      }
       this.emitTelemetry(0, 1.0, 'HARD_SEEK');
       return;
     }

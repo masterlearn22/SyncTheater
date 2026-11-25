@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -78,7 +79,7 @@ func main() {
 					Name:       entry.Name(),
 					Size:       info.Size(),
 					ModifiedAt: info.ModTime().UnixMilli(),
-					StreamURL:  "/stream?file=" + entry.Name(),
+					StreamURL:  "/stream?file=" + url.QueryEscape(entry.Name()),
 				})
 			}
 		}

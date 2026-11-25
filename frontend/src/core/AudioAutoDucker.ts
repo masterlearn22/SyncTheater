@@ -18,8 +18,10 @@ export class AudioAutoDucker {
   private rmsThreshold = 0.045; // Ambang batas deteksi suara bicara
 
   private speechStartTimestamp: number | null = null;
+  private lastSpeechTimestamp: number | null = null;
   private isCurrentlyDucked = false;
   private rampAnimationId: number | null = null;
+  private dataArray: Float32Array<ArrayBuffer> | null = null;
 
   private onRmsUpdate?: (rms: number, isDucked: boolean, currentVideoVolume: number) => void;
 
@@ -60,6 +62,9 @@ export class AudioAutoDucker {
 
     const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
     this.audioCtx = new AudioCtx();
+    if (this.audioCtx.state === 'suspended') {
+      this.audioCtx.resume().catch(() => {});
+    }
     this.analyser = this.audioCtx.createAnalyser();
     this.analyser.fftSize = 256;
     this.analyser.smoothingTimeConstant = 0.6;
@@ -68,15 +73,15 @@ export class AudioAutoDucker {
     this.sourceNode.connect(this.analyser);
 
     const bufferLength = this.analyser.fftSize;
-    const dataArray = new Float32Array(bufferLength);
+    this.dataArray = new Float32Array(new ArrayBuffer(bufferLength * 4));
 
     const monitorLoop = () => {
-      if (!this.analyser) return;
-      this.analyser.getFloatTimeDomainData(dataArray);
+      if (!this.analyser || !this.dataArray) return;
+      this.analyser.getFloatTimeDomainData(this.dataArray);
 
       let sumSquares = 0;
       for (let i = 0; i < bufferLength; i++) {
-        sumSquares += dataArray[i] * dataArray[i];
+        sumSquares += this.dataArray[i] * this.dataArray[i];
       }
       const rms = Math.sqrt(sumSquares / bufferLength);
       this.processRmsSample(rms);
@@ -91,6 +96,7 @@ export class AudioAutoDucker {
     const now = performance.now();
 
     if (this.enabled && rms >= this.rmsThreshold) {
+      this.lastSpeechTimestamp = now;
       if (this.speechStartTimestamp === null) {
         this.speechStartTimestamp = now;
       } else if (now - this.speechStartTimestamp >= 100 && !this.isCurrentlyDucked) {
@@ -101,8 +107,11 @@ export class AudioAutoDucker {
       }
     } else {
       this.speechStartTimestamp = null;
-      if (this.isCurrentlyDucked) {
-        // Selesai berbicara -> kembalikan ke 100% baseVolume dalam 450 ms
+      // Hangover 450 ms agar jeda napas antar kata tidak membuat volume naik-turun
+      if (
+        this.isCurrentlyDucked &&
+        (this.lastSpeechTimestamp === null || now - this.lastSpeechTimestamp >= 450)
+      ) {
         this.isCurrentlyDucked = false;
         this.rampVideoVolume(this.baseVolume, 450);
       }
@@ -141,6 +150,10 @@ export class AudioAutoDucker {
     if (this.rafId !== null) {
       window.cancelAnimationFrame(this.rafId);
       this.rafId = null;
+    }
+    if (this.rampAnimationId !== null) {
+      window.cancelAnimationFrame(this.rampAnimationId);
+      this.rampAnimationId = null;
     }
     this.sourceNode?.disconnect();
     this.analyser?.disconnect();

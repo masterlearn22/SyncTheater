@@ -144,8 +144,8 @@ export class WebRTCManager {
    */
   public async applySenderVideoBitrate(
     pc: RTCPeerConnection,
-    targetBitrateBps = 5000000,
-    preference: 'maintain-resolution' | 'balanced' = 'maintain-resolution'
+    targetBitrateBps = 3500000,
+    preference: 'maintain-resolution' | 'balanced' | 'maintain-framerate' = 'balanced'
   ): Promise<void> {
     try {
       const senders = pc.getSenders();
@@ -157,12 +157,23 @@ export class WebRTCManager {
           }
           for (const enc of params.encodings) {
             enc.maxBitrate = targetBitrateBps;
-            (enc as any).minBitrate = Math.min(2500000, targetBitrateBps);
-            enc.maxFramerate = 60;
+            enc.maxFramerate = 30;
             enc.scaleResolutionDownBy = 1.0;
           }
           (params as any).degradationPreference = preference;
-          await sender.setParameters(params);
+          try {
+            await sender.setParameters(params);
+          } catch {
+            // Fallback jika browser menolak properti opsional seperti degradationPreference
+            const fallbackParams = sender.getParameters();
+            if (!fallbackParams.encodings || fallbackParams.encodings.length === 0) {
+              fallbackParams.encodings = [{}];
+            }
+            for (const enc of fallbackParams.encodings) {
+              enc.maxBitrate = targetBitrateBps;
+            }
+            await sender.setParameters(fallbackParams);
+          }
         }
       }
     } catch (err) {
@@ -240,7 +251,7 @@ export class WebRTCManager {
    * minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1;maxaveragebitrate=192000;cbr=1
    */
   public static mungeOpusStereoHighBitrate(sdp: string): string {
-    const lines = sdp.split('\r\n');
+    const lines = sdp.split(/\r?\n/);
     let opusPayloadType: string | null = null;
 
     for (const line of lines) {

@@ -1,4 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { AudioAutoDucker } from './core/AudioAutoDucker';
+import { SyncEngine } from './core/SyncEngine';
+import { DemoCanvas } from './components/DemoCanvas';
 import {
   Play,
   Pause,
@@ -160,10 +163,10 @@ function mungeOpusStereoHighBitrate(sdp: string): string {
  * - b=AS:5000 (5000 kbps) & b=TIAS:5000000 (5 Mbps)
  * - x-google-min-bitrate=2500;x-google-max-bitrate=5000;x-google-start-bitrate=4500
  */
-function mungeVideoBitrate(sdp: string, targetBitrateKbps = 5000): string {
+function mungeVideoBitrate(sdp: string, targetBitrateKbps = 3000): string {
   const lines = sdp.split(/\r?\n/);
-  const minKbps = Math.max(1000, Math.floor(targetBitrateKbps * 0.5));
-  const startKbps = Math.max(minKbps, Math.floor(targetBitrateKbps * 0.85));
+  const minKbps = Math.min(400, Math.floor(targetBitrateKbps * 0.25));
+  const startKbps = Math.max(minKbps, Math.floor(targetBitrateKbps * 0.7));
   const tiasBps = targetBitrateKbps * 1000;
 
   let inVideoSection = false;
@@ -312,16 +315,20 @@ export default function App() {
   const [inRoom, setInRoom] = useState<boolean>(false);
   const [role, setRole] = useState<UserRole>('HOST');
   const [nickname, setNickname] = useState<string>('Surya');
+  const [hostNicknameInput, setHostNicknameInput] = useState<string>('Surya');
+  const [guestNicknameInput, setGuestNicknameInput] = useState<string>('Adek');
   const [roomCodeInput, setRoomCodeInput] = useState<string>('SURYA-ADEK');
   const [joinCodeInput, setJoinCodeInput] = useState<string>('SURYA-ADEK');
   const [activeRoomCode, setActiveRoomCode] = useState<string>('SURYA-ADEK');
-  const [p2pStatus, setP2pStatus] = useState<'READY' | 'CONNECTING' | 'CONNECTED'>('READY');
-  const [connectedPartnerName, setConnectedPartnerName] = useState<string>('Adek (Terhubung)');
+  const [p2pStatus, setP2pStatus] = useState<'READY' | 'CONNECTING' | 'CONNECTED' | 'ERROR'>('READY');
+  const [peerErrorMsg, setPeerErrorMsg] = useState<string | null>(null);
+  const [connectedPartnerName, setConnectedPartnerName] = useState<string>('Menunggu pasangan bergabung...');
   const [showSplitGuestPreview, setShowSplitGuestPreview] = useState<boolean>(false);
   const [showQuickGuideModal, setShowQuickGuideModal] = useState<boolean>(false);
 
   // State Pemutar Video & Media
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const remoteVoiceAudioRef = useRef<HTMLAudioElement | null>(null);
   const demoCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const guestCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const stageContainerRef = useRef<HTMLDivElement | null>(null);
@@ -330,6 +337,7 @@ export default function App() {
   const [localVideoName, setLocalVideoName] = useState<string>('Film Demo Bioskop (Klik Pilih Film .MP4 untuk Ganti)');
   const [externalUrlInput, setExternalUrlInput] = useState<string>('');
   const [showMediaModal, setShowMediaModal] = useState<boolean>(false);
+  const [serverMovies, setServerMovies] = useState<Array<{ name: string; size: number; streamUrl: string }>>([]);
 
   const [isPlaying, setIsPlaying] = useState<boolean>(true);
   const [playActionFeedback, setPlayActionFeedback] = useState<'PLAY' | 'PAUSE' | null>(null);
@@ -344,22 +352,21 @@ export default function App() {
   // State Sinkronisasi 3 Zona
   const [isSoftCorrecting, setIsSoftCorrecting] = useState<boolean>(false);
   const [telemetry, setTelemetry] = useState<SyncTelemetry>({
-    rttMs: 14,
-    oneWayLatencyMs: 7,
-    clockOffsetMs: -3,
-    driftSeconds: 0.004,
+    rttMs: 0,
+    oneWayLatencyMs: 0,
+    clockOffsetMs: 0,
+    driftSeconds: 0,
     activePlaybackRate: 1.0,
     zone: 'LOCKED_SYNC',
-    samplesCollected: 5,
+    samplesCollected: 0,
   });
 
   // State Voice Chat & Auto-Ducking
-  const [isVoiceActive, setIsVoiceActive] = useState<boolean>(true);
+  const [voiceConnected, setVoiceConnected] = useState<boolean>(false);
   const [isMicMuted, setIsMicMuted] = useState<boolean>(false);
   const [autoDuckEnabled, setAutoDuckEnabled] = useState<boolean>(true);
   const [partnerSpeakingSim, setPartnerSpeakingSim] = useState<boolean>(false);
   const [liveMicListening, setLiveMicListening] = useState<boolean>(false);
-  const [partnerRms, setPartnerRms] = useState<number>(0.01);
   const [isDucked, setIsDucked] = useState<boolean>(false);
 
   // State Subtitle (.SRT -> .VTT)
@@ -370,12 +377,12 @@ export default function App() {
   const [vttPreviewText, setVttPreviewText] = useState<string>('');
   const [subtitlesEnabled, setSubtitlesEnabled] = useState<boolean>(true);
 
-  // Pengaturan WebRTC High-Bitrate & Resolusi Tajam (Anti-Burik & Anti-Lag)
-  const [streamBitrateKbps, setStreamBitrateKbps] = useState<number>(5000); // Default 5 Mbps
-  const [streamQualityMode, setStreamQualityMode] = useState<'SHARP' | 'MOTION'>('SHARP'); // 'SHARP' = maintain-resolution
+  // Pengaturan WebRTC Adaptif (Default 3 Mbps Balanced 30fps agar anti-lag)
+  const [streamBitrateKbps, setStreamBitrateKbps] = useState<number>(3000);
+  const [streamQualityMode, setStreamQualityMode] = useState<'BALANCED' | 'SHARP' | 'MOTION'>('BALANCED');
   const [showBitrateSettings, setShowBitrateSettings] = useState<boolean>(false);
-  const streamBitrateRef = useRef<number>(5000);
-  const streamQualityModeRef = useRef<'SHARP' | 'MOTION'>('SHARP');
+  const streamBitrateRef = useRef<number>(3000);
+  const streamQualityModeRef = useRef<'BALANCED' | 'SHARP' | 'MOTION'>('BALANCED');
   streamBitrateRef.current = streamBitrateKbps;
   streamQualityModeRef.current = streamQualityMode;
 
@@ -398,28 +405,50 @@ export default function App() {
       id: 'init-1',
       time: '12:07:02',
       action: 'NTP_PING',
-      detail: '5 sampel PING selesai: RTT min 14ms, One-Way Latency 7ms, Offset -3ms',
+      detail: 'Siap melakukan kalibrasi NTP-Lite saat terhubung ke pasangan.',
       zone: 'LOCKED_SYNC',
     },
   ]);
   const [copiedCmd, setCopiedCmd] = useState<string | null>(null);
 
-  // Referensi Audio, BroadcastChannel, & PeerJS P2P
+  // Referensi Audio, BroadcastChannel, Sync, & PeerJS P2P
   const hudTimeoutRef = useRef<number | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
+  const autoDuckerRef = useRef<AudioAutoDucker | null>(null);
+  const rmsBarRef = useRef<HTMLDivElement | null>(null);
+  const lastDuckedStateRef = useRef<boolean>(false);
+  const lastEffVolRef = useRef<number>(1.0);
   const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
   const peerInstanceRef = useRef<any>(null);
-  const peerConnRef = useRef<any>(null);
+  const peerConnsRef = useRef<Map<string, any>>(new Map());
   const connectedGuestPeerIdRef = useRef<string | null>(null);
   const outgoingMediaStreamRef = useRef<MediaStream | null>(null);
   const activeMediaCallRef = useRef<any>(null);
+  const activeVoiceCallRef = useRef<any>(null);
+  const heartbeatTimerRef = useRef<number | null>(null);
+  const hostTimeRef = useRef<number>(0);
+  const clientTimeRef = useRef<number>(0);
+  const softCorrectingRef = useRef<boolean>(false);
+  const clockOffsetMsRef = useRef<number>(0);
+  const pingSamplesRef = useRef<Array<{ rtt: number; clockOffset: number }>>([]);
+  const prevBlobUrlRef = useRef<string | null>(null);
+  const isPlayingRef = useRef<boolean>(true);
+  const localVideoUrlRef = useRef<string | null>(null);
+  const hasRemoteVideoStreamRef = useRef<boolean>(false);
+  const roleRef = useRef<UserRole>('HOST');
+  const isVideoMutedRef = useRef<boolean>(false);
+
   const [isHostStreaming, setIsHostStreaming] = useState<boolean>(false);
   const [streamingSourceLabel, setStreamingSourceLabel] = useState<string>('');
   const [hasRemoteVideoStream, setHasRemoteVideoStream] = useState<boolean>(false);
   const remoteMediaStreamRef = useRef<MediaStream | null>(null);
   const [autoplayBlocked, setAutoplayBlocked] = useState<boolean>(false);
+
+  isPlayingRef.current = isPlaying;
+  localVideoUrlRef.current = localVideoUrl;
+  hasRemoteVideoStreamRef.current = hasRemoteVideoStream;
+  roleRef.current = role;
+  isVideoMutedRef.current = isVideoMuted;
 
   const appendLog = useCallback((action: SyncLogItem['action'], detail: string, zone: SyncZone) => {
     const nowStr = new Date().toTimeString().slice(0, 8);
@@ -462,7 +491,7 @@ export default function App() {
   }, []);
 
   // Patch global RTCPeerConnection.prototype.setLocalDescription
-  // agar setiap SDP offer/answer yang dibuat PeerJS otomatis membawa konfigurasi High-Bitrate Video (5 Mbps) & Opus Stereo (192k)
+  // agar setiap SDP offer/answer membawa konfigurasi bitrate adaptif & Opus Stereo 192k
   useEffect(() => {
     if (typeof window === 'undefined' || !(window as any).RTCPeerConnection) return;
     const OriginalPC = window.RTCPeerConnection;
@@ -471,24 +500,24 @@ export default function App() {
 
     const origSetLocal = OriginalPC.prototype.setLocalDescription;
     OriginalPC.prototype.setLocalDescription = async function (desc?: any) {
-      if (desc && desc.sdp) {
+      if (desc && typeof desc.sdp === 'string' && desc.sdp.length > 0) {
         try {
-          const targetKbps = streamBitrateRef.current || 5000;
+          const targetKbps = streamBitrateRef.current || 3000;
           const munged = mungeFullSdp(desc.sdp, targetKbps);
           const newDesc = new RTCSessionDescription({
             type: desc.type,
             sdp: munged,
           });
-          return (origSetLocal as any).call(this, newDesc);
+          return await (origSetLocal as any).call(this, newDesc);
         } catch (e) {
-          console.warn('[SyncTheater] Gagal munging SDP:', e);
+          console.warn('[SyncTheater] Fallback SDP asli karena munging ditolak browser:', e);
         }
       }
       return (origSetLocal as any).call(this, desc);
     };
   }, []);
 
-  // Mengatur RTCRtpSender pada MediaConnection agar bitrate terkunci ke 4-5 Mbps dan anti-burik
+  // Mengatur RTCRtpSender pada MediaConnection secara aman dengan fallback
   const setupHighQualityCall = useCallback((call: any) => {
     if (!call) return;
     const pc: RTCPeerConnection | undefined = call.peerConnection;
@@ -503,28 +532,41 @@ export default function App() {
             if (!params.encodings || params.encodings.length === 0) {
               params.encodings = [{}];
             }
-            const currentKbps = streamBitrateRef.current || 5000;
-            const currentMode = streamQualityModeRef.current || 'SHARP';
+            const currentKbps = streamBitrateRef.current || 3000;
+            const currentMode = streamQualityModeRef.current || 'BALANCED';
             const bitrateBps = currentKbps * 1000;
+            const targetFps = currentMode === 'MOTION' ? 60 : 30;
 
             for (const enc of params.encodings) {
               enc.maxBitrate = bitrateBps;
-              (enc as any).minBitrate = Math.min(2500000, bitrateBps);
-              enc.maxFramerate = 60;
+              enc.maxFramerate = targetFps;
               enc.scaleResolutionDownBy = 1.0;
             }
 
             (params as any).degradationPreference =
-              currentMode === 'SHARP' ? 'maintain-resolution' : 'balanced';
+              currentMode === 'SHARP'
+                ? 'maintain-resolution'
+                : currentMode === 'MOTION'
+                ? 'maintain-framerate'
+                : 'balanced';
 
-            await sender.setParameters(params);
-            console.log(
-              `[SyncTheater WebRTC] Bitrate sender di-set ke ${currentKbps} kbps (${currentMode})`
-            );
+            try {
+              await sender.setParameters(params);
+            } catch {
+              // Fallback aman bila browser menolak degradationPreference/maxFramerate
+              const fallback = sender.getParameters();
+              if (!fallback.encodings || fallback.encodings.length === 0) {
+                fallback.encodings = [{}];
+              }
+              for (const enc of fallback.encodings) {
+                enc.maxBitrate = bitrateBps;
+              }
+              await sender.setParameters(fallback);
+            }
           }
         }
-      } catch (err) {
-        // abaikan bila belum siap
+      } catch {
+        // abaikan bila koneksi belum siap
       }
     };
 
@@ -535,9 +577,8 @@ export default function App() {
     });
 
     applyParams();
-    window.setTimeout(applyParams, 300);
-    window.setTimeout(applyParams, 1200);
-    window.setTimeout(applyParams, 3000);
+    window.setTimeout(applyParams, 400);
+    window.setTimeout(applyParams, 1500);
   }, []);
 
   const changeStreamBitrate = (newKbps: number) => {
@@ -554,7 +595,7 @@ export default function App() {
     addSystemChat(`Bitrate WebRTC diatur ke ${(newKbps / 1000).toFixed(1)} Mbps`);
   };
 
-  const changeQualityMode = (mode: 'SHARP' | 'MOTION') => {
+  const changeQualityMode = (mode: 'BALANCED' | 'SHARP' | 'MOTION') => {
     setStreamQualityMode(mode);
     streamQualityModeRef.current = mode;
     if (outgoingMediaStreamRef.current) {
@@ -569,10 +610,121 @@ export default function App() {
     }
     appendLog(
       'ROOM_EVENT',
-      `Mode WebRTC diubah ke ${mode === 'SHARP' ? 'Resolusi Tajam (Anti-Burik)' : 'Gerakan Mulus (60 FPS)'}`,
+      `Mode WebRTC diubah ke ${
+        mode === 'BALANCED'
+          ? 'Adaptif Anti-Lag (30 FPS)'
+          : mode === 'SHARP'
+          ? 'Resolusi Tajam'
+          : 'Gerakan Mulus (60 FPS)'
+      }`,
       'LOCKED_SYNC'
     );
   };
+
+  // Muat daftar film dari server Go (/api/movies) jika dijalankan via nobar.exe
+  useEffect(() => {
+    fetch('/api/movies')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (data && Array.isArray(data.movies)) {
+          setServerMovies(data.movies);
+        }
+      })
+      .catch(() => {
+        // Mode static / GitHub Pages tanpa backend Go
+      });
+  }, []);
+
+  // Helper aman mengganti sumber video & membersihkan blob URL sebelumnya (cegah memory leak)
+  const selectVideoSource = useCallback((url: string | null, name: string) => {
+    if (prevBlobUrlRef.current && prevBlobUrlRef.current !== url) {
+      URL.revokeObjectURL(prevBlobUrlRef.current);
+      prevBlobUrlRef.current = null;
+    }
+    if (url && url.startsWith('blob:')) {
+      prevBlobUrlRef.current = url;
+    }
+    if (videoRef.current && videoRef.current.srcObject) {
+      videoRef.current.srcObject = null;
+    }
+    setHasRemoteVideoStream(false);
+    setLocalVideoUrl(url);
+    setLocalVideoName(name);
+    hostTimeRef.current = 0;
+    clientTimeRef.current = 0;
+    setHostTime(0);
+    setClientTime(0);
+  }, []);
+
+  // Cleanup blob URL saat komponen di-unmount
+  useEffect(() => {
+    return () => {
+      if (prevBlobUrlRef.current) {
+        URL.revokeObjectURL(prevBlobUrlRef.current);
+      }
+      autoDuckerRef.current?.stop();
+    };
+  }, []);
+
+  // Inisialisasi AudioAutoDucker berbasis Web Audio API (update meter via ref agar 0 re-render)
+  useEffect(() => {
+    const ducker = new AudioAutoDucker((rms, ducked, currentVol) => {
+      if (rmsBarRef.current) {
+        const pct = Math.min(100, Math.round(rms * 550));
+        rmsBarRef.current.style.width = `${pct}%`;
+        rmsBarRef.current.className = `h-full transition-all duration-75 ${
+          ducked ? 'bg-amber-400' : 'bg-indigo-500'
+        }`;
+      }
+      if (lastDuckedStateRef.current !== ducked) {
+        lastDuckedStateRef.current = ducked;
+        setIsDucked(ducked);
+      }
+      const roundedVol = +currentVol.toFixed(2);
+      if (Math.abs(lastEffVolRef.current - roundedVol) >= 0.02) {
+        lastEffVolRef.current = roundedVol;
+        setEffectiveVolume(roundedVol);
+      }
+    });
+    autoDuckerRef.current = ducker;
+    return () => {
+      ducker.stop();
+      autoDuckerRef.current = null;
+    };
+  }, []);
+
+  // Sinkronkan videoRef, volume, mute, dan status autoDuckEnabled ke AudioAutoDucker
+  useEffect(() => {
+    const ducker = autoDuckerRef.current;
+    if (!ducker) return;
+    ducker.attachVideo(videoRef.current);
+    ducker.setBaseVolume(isVideoMuted ? 0 : baseVolume);
+    ducker.setEnabled(autoDuckEnabled);
+    if (videoRef.current) {
+      videoRef.current.muted = isVideoMuted;
+      if (!isVideoMuted && !lastDuckedStateRef.current) {
+        videoRef.current.volume = baseVolume;
+      }
+    }
+  }, [baseVolume, isVideoMuted, autoDuckEnabled, localVideoUrl, hasRemoteVideoStream, inRoom]);
+
+  // Simulasi suara pasangan (hanya berjalan jika tombol simulasi diaktifkan)
+  useEffect(() => {
+    if (!partnerSpeakingSim) {
+      if (autoDuckerRef.current && !voiceConnected) {
+        autoDuckerRef.current.processRmsSample(0.005);
+      }
+      return;
+    }
+    const timer = window.setInterval(() => {
+      const simRms = 0.13 + Math.sin(Date.now() / 90) * 0.04;
+      autoDuckerRef.current?.processRmsSample(simRms);
+    }, 120);
+    return () => {
+      window.clearInterval(timer);
+      autoDuckerRef.current?.processRmsSample(0.005);
+    };
+  }, [partnerSpeakingSim, voiceConnected]);
 
   // Tempelkan MediaStream jarak jauh ke elemen <video> saat terpasang (khususnya di browser HP)
   useEffect(() => {
@@ -600,6 +752,137 @@ export default function App() {
     return () => URL.revokeObjectURL(url);
   }, [srtRawText]);
 
+  const broadcastRoomPacket = useCallback((packet: Record<string, any>) => {
+    try {
+      broadcastChannelRef.current?.postMessage(packet);
+    } catch {
+      // ignore
+    }
+    peerConnsRef.current.forEach((conn, peerId) => {
+      try {
+        if (conn && conn.open) {
+          conn.send(packet);
+        } else if (!conn || conn._closed) {
+          peerConnsRef.current.delete(peerId);
+        }
+      } catch {
+        // ignore
+      }
+    });
+  }, []);
+
+  const startNtpCalibrationP2P = useCallback(() => {
+    pingSamplesRef.current = [];
+    for (let seq = 1; seq <= 5; seq++) {
+      window.setTimeout(() => {
+        broadcastRoomPacket({
+          type: 'P2P_PING',
+          seq,
+          clientSentTime: Date.now(),
+        });
+      }, (seq - 1) * 180);
+    }
+  }, [broadcastRoomPacket]);
+
+  const placeVoiceCallToPeer = useCallback((targetPeerId: string) => {
+    if (!peerInstanceRef.current || !micStreamRef.current || !targetPeerId) return;
+    try {
+      activeVoiceCallRef.current?.close?.();
+      const vCall = peerInstanceRef.current.call(targetPeerId, micStreamRef.current, {
+        metadata: { kind: 'voice' },
+      });
+      activeVoiceCallRef.current = vCall;
+      vCall.on('stream', (remoteAudio: MediaStream) => {
+        if (remoteVoiceAudioRef.current) {
+          remoteVoiceAudioRef.current.srcObject = remoteAudio;
+          remoteVoiceAudioRef.current.play().catch(() => {});
+        }
+        autoDuckerRef.current?.connectStream(remoteAudio);
+        setVoiceConnected(true);
+      });
+      vCall.on('close', () => {
+        setVoiceConnected(false);
+      });
+    } catch {
+      // abaikan bila gagal memulai panggilan suara
+    }
+  }, []);
+
+  const handleIncomingCall = useCallback(
+    (call: any, currentRole: UserRole) => {
+      const kind = call?.metadata?.kind;
+      if (kind === 'voice') {
+        call.answer(micStreamRef.current || undefined);
+        activeVoiceCallRef.current = call;
+        call.on('stream', (remoteAudio: MediaStream) => {
+          if (remoteVoiceAudioRef.current) {
+            remoteVoiceAudioRef.current.srcObject = remoteAudio;
+            remoteVoiceAudioRef.current.play().catch(() => {});
+          }
+          autoDuckerRef.current?.connectStream(remoteAudio);
+          setVoiceConnected(true);
+          addSystemChat('Voice Chat P2P terhubung! Suara film otomatis mengecil saat pasangan bicara.');
+        });
+        call.on('close', () => {
+          setVoiceConnected(false);
+        });
+        return;
+      }
+
+      // Video / Screen Share call
+      call.answer();
+      activeMediaCallRef.current = call;
+      try {
+        const pc: RTCPeerConnection | undefined = call.peerConnection;
+        if (pc) {
+          const setReceiverDelay = () => {
+            pc.getReceivers().forEach((receiver: any) => {
+              if ('playoutDelayHint' in receiver) {
+                receiver.playoutDelayHint = 0.18;
+              }
+            });
+          };
+          setReceiverDelay();
+          pc.addEventListener('track', (e) => {
+            if (e.receiver && 'playoutDelayHint' in e.receiver) {
+              e.receiver.playoutDelayHint = 0.18;
+            }
+          });
+        }
+      } catch {
+        // abaikan jika browser tidak mendukung playoutDelayHint
+      }
+      call.on('stream', (remoteStream: MediaStream) => {
+        if (remoteStream.getVideoTracks().length > 0) {
+          if (prevBlobUrlRef.current) {
+            URL.revokeObjectURL(prevBlobUrlRef.current);
+            prevBlobUrlRef.current = null;
+          }
+          setLocalVideoUrl(null);
+          remoteMediaStreamRef.current = remoteStream;
+          setHasRemoteVideoStream(true);
+          setIsPlaying(true);
+          setLocalVideoName(
+            currentRole === 'GUEST'
+              ? 'Live Stream dari Host (WebRTC)'
+              : 'Live Stream Aktif'
+          );
+          addSystemChat('Menerima siaran film langsung dari Host!');
+        } else if (remoteStream.getAudioTracks().length > 0) {
+          if (remoteVoiceAudioRef.current) {
+            remoteVoiceAudioRef.current.srcObject = remoteStream;
+            remoteVoiceAudioRef.current.play().catch(() => {});
+          }
+          autoDuckerRef.current?.connectStream(remoteStream);
+          setVoiceConnected(true);
+        }
+      });
+    },
+    [addSystemChat]
+  );
+
+  const handleIncomingRoomPacketRef = useRef<(data: any, sourceConn?: any) => void>(() => {});
+
   // Koneksi Room ID via BroadcastChannel (antar-tab) & PeerJS WebRTC P2P (antar-perangkat)
   const connectToRoom = useCallback(
     (code: string, selectedRole: UserRole, userNickname: string) => {
@@ -609,15 +892,19 @@ export default function App() {
       setNickname(userNickname);
       setInRoom(true);
       setP2pStatus('CONNECTING');
+      setPeerErrorMsg(null);
+      setConnectedPartnerName(
+        selectedRole === 'HOST' ? 'Menunggu pasangan masuk...' : 'Menghubungkan ke Host...'
+      );
 
-      // 1. Setup BroadcastChannel untuk sinkronisasi instan jika membuka 2 tab di browser yang sama
+      // 1. Setup BroadcastChannel untuk sinkronisasi antar-tab di browser yang sama
       try {
         broadcastChannelRef.current?.close();
         const bc = new BroadcastChannel(`synctheater_${cleanCode}`);
         bc.onmessage = (ev) => {
           const data = ev.data;
           if (!data) return;
-          handleIncomingRoomPacket(data);
+          handleIncomingRoomPacketRef.current(data);
         };
         broadcastChannelRef.current = bc;
       } catch {
@@ -629,6 +916,7 @@ export default function App() {
         const PeerClass = (window as any).Peer;
         if (PeerClass) {
           peerInstanceRef.current?.destroy?.();
+          peerConnsRef.current.clear();
           const sanitizedId = cleanCode.replace(/[^A-Z0-9]/g, '');
           const hostPeerId = `synctheater-host-${sanitizedId}`;
 
@@ -636,72 +924,66 @@ export default function App() {
             const peer = new PeerClass(hostPeerId);
             peer.on('open', () => {
               setP2pStatus('CONNECTED');
+              setPeerErrorMsg(null);
               appendLog('ROOM_EVENT', `Room ${cleanCode} aktif di PeerJS Cloud Broker`, 'LOCKED_SYNC');
             });
             peer.on('connection', (conn: any) => {
-              peerConnRef.current = conn;
-              setConnectedPartnerName('Pasangan Terhubung (P2P Aktif)');
-              addSystemChat('Pasangan berhasil masuk ke dalam Room!');
-              conn.on('data', (data: any) => handleIncomingRoomPacket(data));
+              peerConnsRef.current.set(conn.peer, conn);
+              conn.on('data', (data: any) => handleIncomingRoomPacketRef.current(data, conn));
+              conn.on('close', () => {
+                peerConnsRef.current.delete(conn.peer);
+                if (peerConnsRef.current.size === 0) {
+                  setConnectedPartnerName('Pasangan keluar / terputus');
+                }
+              });
             });
-            peer.on('call', (call: any) => {
-              call.answer(micStreamRef.current || undefined);
-            });
-            peer.on('error', () => {
-              setP2pStatus('CONNECTED');
+            peer.on('call', (call: any) => handleIncomingCall(call, 'HOST'));
+            peer.on('error', (err: any) => {
+              const type = err?.type || 'unknown';
+              const msg =
+                type === 'unavailable-id'
+                  ? `Kode Room "${cleanCode}" sedang dipakai tab/host lain. Gunakan kode lain atau tutup tab lama.`
+                  : `Gagal terhubung ke broker PeerJS (${type}).`;
+              setP2pStatus('ERROR');
+              setPeerErrorMsg(msg);
+              appendLog('ROOM_EVENT', msg, 'HARD_SEEK');
+              addSystemChat(`⚠️ ${msg}`);
             });
             peerInstanceRef.current = peer;
           } else {
             const guestPeer = new PeerClass();
             guestPeer.on('open', () => {
-              const conn = guestPeer.connect(hostPeerId);
-              peerConnRef.current = conn;
+              const conn = guestPeer.connect(hostPeerId, { reliable: true });
+              peerConnsRef.current.set(hostPeerId, conn);
               conn.on('open', () => {
                 setP2pStatus('CONNECTED');
+                setPeerErrorMsg(null);
                 setConnectedPartnerName('Terhubung ke Host Room');
                 conn.send({
                   type: 'JOIN_ANNOUNCE',
                   sender: userNickname,
                   guestPeerId: guestPeer.id,
                 });
+                startNtpCalibrationP2P();
               });
-              conn.on('data', (data: any) => handleIncomingRoomPacket(data));
-            });
-            guestPeer.on('call', (call: any) => {
-              call.answer();
-              // Optimasi jitter buffer receiver ke 180ms agar 1080p 5 Mbps lancar tanpa stutter di Wi-Fi
-              try {
-                const pc: RTCPeerConnection | undefined = call.peerConnection;
-                if (pc) {
-                  const setReceiverDelay = () => {
-                    pc.getReceivers().forEach((receiver: any) => {
-                      if ('playoutDelayHint' in receiver) {
-                        receiver.playoutDelayHint = 0.18;
-                      }
-                    });
-                  };
-                  setReceiverDelay();
-                  pc.addEventListener('track', (e) => {
-                    if (e.receiver && 'playoutDelayHint' in e.receiver) {
-                      e.receiver.playoutDelayHint = 0.18;
-                    }
-                  });
-                }
-              } catch {
-                // abaikan jika browser tidak mendukung playoutDelayHint
-              }
-              call.on('stream', (remoteStream: MediaStream) => {
-                if (remoteStream.getVideoTracks().length > 0) {
-                  remoteMediaStreamRef.current = remoteStream;
-                  setHasRemoteVideoStream(true);
-                  setIsPlaying(true);
-                  setLocalVideoName('Live Stream dari Host (WebRTC 5 Mbps Full HD)');
-                  addSystemChat('Menerima siaran film lancar (5 Mbps High-Bitrate) langsung dari Host!');
-                }
+              conn.on('data', (data: any) => handleIncomingRoomPacketRef.current(data, conn));
+              conn.on('close', () => {
+                peerConnsRef.current.delete(hostPeerId);
+                setP2pStatus('CONNECTING');
+                setConnectedPartnerName('Koneksi ke Host terputus');
               });
             });
-            guestPeer.on('error', () => {
-              setP2pStatus('CONNECTED');
+            guestPeer.on('call', (call: any) => handleIncomingCall(call, 'GUEST'));
+            guestPeer.on('error', (err: any) => {
+              const type = err?.type || 'unknown';
+              const msg =
+                type === 'peer-unavailable'
+                  ? `Room "${cleanCode}" belum dibuat oleh Host. Pastikan Host sudah masuk lebih dulu.`
+                  : `Koneksi P2P gagal (${type}).`;
+              setP2pStatus('ERROR');
+              setPeerErrorMsg(msg);
+              appendLog('ROOM_EVENT', msg, 'HARD_SEEK');
+              addSystemChat(`⚠️ ${msg}`);
             });
             peerInstanceRef.current = guestPeer;
           }
@@ -709,46 +991,189 @@ export default function App() {
           setP2pStatus('CONNECTED');
         }
       } catch {
-        setP2pStatus('CONNECTED');
+        setP2pStatus('ERROR');
+        setPeerErrorMsg('Gagal menginisialisasi koneksi WebRTC.');
       }
     },
-    [appendLog, addSystemChat]
+    [appendLog, addSystemChat, handleIncomingCall, startNtpCalibrationP2P]
   );
 
-  const broadcastRoomPacket = useCallback((packet: Record<string, any>) => {
-    try {
-      broadcastChannelRef.current?.postMessage(packet);
-    } catch {
-      // ignore
+  // Cleanup total saat keluar room
+  const leaveRoom = useCallback(() => {
+    if (heartbeatTimerRef.current) {
+      window.clearInterval(heartbeatTimerRef.current);
+      heartbeatTimerRef.current = null;
     }
-    try {
-      if (peerConnRef.current && peerConnRef.current.open) {
-        peerConnRef.current.send(packet);
+    outgoingMediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+    outgoingMediaStreamRef.current = null;
+    micStreamRef.current?.getTracks().forEach((t) => t.stop());
+    micStreamRef.current = null;
+    activeMediaCallRef.current?.close?.();
+    activeMediaCallRef.current = null;
+    activeVoiceCallRef.current?.close?.();
+    activeVoiceCallRef.current = null;
+    peerConnsRef.current.forEach((conn) => {
+      try {
+        conn.close?.();
+      } catch {
+        // ignore
       }
-    } catch {
-      // ignore
+    });
+    peerConnsRef.current.clear();
+    peerInstanceRef.current?.destroy?.();
+    peerInstanceRef.current = null;
+    broadcastChannelRef.current?.close();
+    broadcastChannelRef.current = null;
+    autoDuckerRef.current?.stop();
+    if (videoRef.current) {
+      videoRef.current.pause();
+      videoRef.current.srcObject = null;
     }
+    if (remoteVoiceAudioRef.current) {
+      remoteVoiceAudioRef.current.srcObject = null;
+    }
+    connectedGuestPeerIdRef.current = null;
+    setIsHostStreaming(false);
+    setStreamingSourceLabel('');
+    setHasRemoteVideoStream(false);
+    setLiveMicListening(false);
+    setVoiceConnected(false);
+    setIsMicMuted(false);
+    setP2pStatus('READY');
+    setPeerErrorMsg(null);
+    setInRoom(false);
   }, []);
 
-  const handleIncomingRoomPacket = (data: any) => {
+  handleIncomingRoomPacketRef.current = (data: any, sourceConn?: any) => {
+    if (data.type === 'P2P_PING') {
+      const pong = {
+        type: 'P2P_PONG',
+        seq: data.seq,
+        clientSentTime: data.clientSentTime,
+        serverTimestamp: Date.now(),
+      };
+      if (sourceConn && sourceConn.open) {
+        sourceConn.send(pong);
+      } else {
+        broadcastRoomPacket(pong);
+      }
+      return;
+    }
+
+    if (data.type === 'P2P_PONG') {
+      const receiveTime = Date.now();
+      const rtt = Math.max(1, receiveTime - data.clientSentTime);
+      const oneWay = rtt / 2;
+      const clockOffset = data.serverTimestamp + oneWay - receiveTime;
+      pingSamplesRef.current.push({ rtt, clockOffset });
+      const best = pingSamplesRef.current.reduce((a, b) => (b.rtt < a.rtt ? b : a));
+      clockOffsetMsRef.current = best.clockOffset;
+      setTelemetry((prev) => ({
+        ...prev,
+        rttMs: Math.round(best.rtt),
+        oneWayLatencyMs: Math.round(best.rtt / 2),
+        clockOffsetMs: Math.round(best.clockOffset),
+        samplesCollected: pingSamplesRef.current.length,
+      }));
+      return;
+    }
+
     if (data.type === 'SYNC_ACTION') {
       const vid = videoRef.current;
-      const hasMedia = Boolean(vid && (vid.src || vid.srcObject));
+      const isDirectVideo = Boolean(vid && vid.src && !vid.srcObject);
+      const isAnyMedia = Boolean(vid && (vid.src || vid.srcObject));
+      const transitSec =
+        typeof data.sentAt === 'number'
+          ? Math.max(0, Math.min(3, (Date.now() + clockOffsetMsRef.current - data.sentAt) / 1000))
+          : 0;
+      const targetTime =
+        typeof data.videoTime === 'number' ? data.videoTime + (data.action === 'PAUSE' ? 0 : transitSec) : 0;
+
       if (data.action === 'PLAY') {
         setIsPlaying(true);
-        if (vid && hasMedia) {
+        if (vid && isAnyMedia) {
+          if (isDirectVideo && typeof data.videoTime === 'number' && Math.abs(targetTime - vid.currentTime) > 0.35) {
+            vid.currentTime = targetTime;
+          }
           vid.play().then(() => setAutoplayBlocked(false)).catch(() => setAutoplayBlocked(true));
         }
       } else if (data.action === 'PAUSE') {
         setIsPlaying(false);
-        if (vid && hasMedia) {
+        if (vid && isAnyMedia) {
           vid.pause();
+          vid.playbackRate = 1.0;
+          softCorrectingRef.current = false;
+          if (isDirectVideo && typeof data.videoTime === 'number' && Math.abs(data.videoTime - vid.currentTime) > 0.2) {
+            vid.currentTime = data.videoTime;
+          }
         }
       } else if (data.action === 'SEEK' && typeof data.videoTime === 'number') {
+        hostTimeRef.current = data.videoTime;
+        clientTimeRef.current = data.videoTime;
         setHostTime(data.videoTime);
         setClientTime(data.videoTime);
-        if (vid && vid.src && !vid.srcObject) {
-          vid.currentTime = data.videoTime;
+        if (vid && isDirectVideo) {
+          vid.currentTime = targetTime;
+          vid.playbackRate = 1.0;
+          softCorrectingRef.current = false;
+        }
+      } else if (data.action === 'HEARTBEAT' && typeof data.videoTime === 'number') {
+        hostTimeRef.current = targetTime;
+        if (!data.isPlaying) {
+          setIsPlaying(false);
+          if (vid && isDirectVideo && !vid.paused) {
+            vid.pause();
+            vid.playbackRate = 1.0;
+          }
+          return;
+        }
+        setIsPlaying(true);
+        if (vid && isDirectVideo) {
+          if (vid.paused) {
+            vid.play().then(() => setAutoplayBlocked(false)).catch(() => setAutoplayBlocked(true));
+          }
+          const deltaT = targetTime - vid.currentTime;
+          const decision = SyncEngine.evaluateThreeZoneCorrection(deltaT, softCorrectingRef.current);
+          softCorrectingRef.current = decision.isSoftCorrecting;
+          if (decision.zone === 'HARD_SEEK') {
+            vid.currentTime = targetTime;
+            vid.playbackRate = 1.0;
+          } else {
+            vid.playbackRate = decision.playbackRate;
+          }
+          setIsSoftCorrecting(decision.isSoftCorrecting);
+          setTelemetry((prev) => ({
+            ...prev,
+            driftSeconds: Math.abs(deltaT) < 0.002 ? 0 : deltaT,
+            activePlaybackRate: decision.playbackRate,
+            zone: decision.zone,
+          }));
+        }
+      } else if (data.action === 'MEDIA_CHANGE' && data.mediaSource) {
+        selectVideoSource(data.mediaSource, data.mediaName || data.mediaSource);
+        addSystemChat(`Host mengganti film ke: ${data.mediaName || data.mediaSource}`);
+      }
+    } else if (data.type === 'HOST_SYNC_SNAPSHOT') {
+      if (data.mediaSource && !data.mediaSource.startsWith('blob:')) {
+        selectVideoSource(data.mediaSource, data.mediaName || data.mediaSource);
+      }
+      if (typeof data.videoTime === 'number') {
+        hostTimeRef.current = data.videoTime;
+        clientTimeRef.current = data.videoTime;
+        setHostTime(data.videoTime);
+        setClientTime(data.videoTime);
+        if (videoRef.current && videoRef.current.src && !videoRef.current.srcObject) {
+          videoRef.current.currentTime = data.videoTime;
+        }
+      }
+      if (typeof data.isPlaying === 'boolean') {
+        setIsPlaying(data.isPlaying);
+        if (videoRef.current && (videoRef.current.src || videoRef.current.srcObject)) {
+          if (data.isPlaying) {
+            videoRef.current.play().then(() => setAutoplayBlocked(false)).catch(() => setAutoplayBlocked(true));
+          } else {
+            videoRef.current.pause();
+          }
         }
       }
     } else if (data.type === 'CHAT_MSG') {
@@ -762,11 +1187,32 @@ export default function App() {
         if (outgoingMediaStreamRef.current && peerInstanceRef.current) {
           const call = peerInstanceRef.current.call(
             data.guestPeerId,
-            outgoingMediaStreamRef.current
+            outgoingMediaStreamRef.current,
+            { metadata: { kind: 'video' } }
           );
           activeMediaCallRef.current = call;
           setupHighQualityCall(call);
         }
+        if (micStreamRef.current) {
+          placeVoiceCallToPeer(data.guestPeerId);
+        }
+      }
+      // Kirim snapshot posisi video terkini ke Guest yang baru masuk
+      const currentVid = videoRef.current;
+      const snapshot = {
+        type: 'HOST_SYNC_SNAPSHOT',
+        videoTime: currentVid ? currentVid.currentTime : hostTimeRef.current,
+        isPlaying: currentVid ? !currentVid.paused : isPlayingRef.current,
+        mediaSource:
+          localVideoUrlRef.current && !localVideoUrlRef.current.startsWith('blob:')
+            ? localVideoUrlRef.current
+            : undefined,
+        mediaName: localVideoName,
+      };
+      if (sourceConn && sourceConn.open) {
+        sourceConn.send(snapshot);
+      } else {
+        broadcastRoomPacket(snapshot);
       }
       addSystemChat(`${data.sender || 'Pasangan'} baru saja bergabung ke Room!`);
     } else if (data.type === 'STREAM_STOPPED') {
@@ -778,8 +1224,35 @@ export default function App() {
     }
   };
 
+  // Heartbeat sinkronisasi dari Host setiap 2 detik saat memutar film langsung (anti-drift)
+  useEffect(() => {
+    if (heartbeatTimerRef.current) {
+      window.clearInterval(heartbeatTimerRef.current);
+      heartbeatTimerRef.current = null;
+    }
+    if (!inRoom || role !== 'HOST') return;
+
+    heartbeatTimerRef.current = window.setInterval(() => {
+      const vid = videoRef.current;
+      if (!vid || !vid.src || vid.srcObject) return;
+      broadcastRoomPacket({
+        type: 'SYNC_ACTION',
+        action: 'HEARTBEAT',
+        videoTime: vid.currentTime,
+        isPlaying: !vid.paused,
+        sentAt: Date.now(),
+      });
+    }, 2000);
+
+    return () => {
+      if (heartbeatTimerRef.current) {
+        window.clearInterval(heartbeatTimerRef.current);
+        heartbeatTimerRef.current = null;
+      }
+    };
+  }, [inRoom, role, broadcastRoomPacket]);
+
   const pushStreamToConnectedGuest = (stream: MediaStream, label: string) => {
-    // Mode SHARP ('detail') mengunci resolusi tajam 1080p agar anti-burik (tidak downscale ke 360p)
     stream.getVideoTracks().forEach((track) => {
       if ('contentHint' in track) {
         (track as any).contentHint = streamQualityModeRef.current === 'SHARP' ? 'detail' : 'motion';
@@ -793,7 +1266,8 @@ export default function App() {
       activeMediaCallRef.current?.close?.();
       const call = peerInstanceRef.current.call(
         connectedGuestPeerIdRef.current,
-        stream
+        stream,
+        { metadata: { kind: 'video' } }
       );
       activeMediaCallRef.current = call;
       setupHighQualityCall(call);
@@ -808,12 +1282,13 @@ export default function App() {
   const startStreamLocalVideoToPartner = () => {
     const vid = videoRef.current as any;
     const canvas = demoCanvasRef.current as any;
+    const fps = streamQualityModeRef.current === 'MOTION' ? 60 : 30;
     let captured: MediaStream | null = null;
 
     if (localVideoUrl && vid) {
-      captured = vid.captureStream ? vid.captureStream(60) : vid.mozCaptureStream?.(60);
+      captured = vid.captureStream ? vid.captureStream(fps) : vid.mozCaptureStream?.(fps);
     } else if (canvas) {
-      captured = canvas.captureStream ? canvas.captureStream(60) : null;
+      captured = canvas.captureStream ? canvas.captureStream(fps) : null;
     }
 
     if (captured) {
@@ -824,12 +1299,13 @@ export default function App() {
   };
 
   const startScreenShareToPartner = async () => {
+    const fps = streamQualityModeRef.current === 'MOTION' ? 60 : 30;
     try {
       const screenStream = await navigator.mediaDevices.getDisplayMedia({
         video: {
           width: { ideal: 1920, max: 1920 },
           height: { ideal: 1080, max: 1080 },
-          frameRate: { ideal: 60, max: 60 },
+          frameRate: { ideal: fps, max: fps },
         },
         audio: {
           echoCancellation: false,
@@ -843,12 +1319,17 @@ export default function App() {
         stopLiveStreaming();
       });
 
+      if (prevBlobUrlRef.current) {
+        URL.revokeObjectURL(prevBlobUrlRef.current);
+        prevBlobUrlRef.current = null;
+      }
+      setLocalVideoUrl(null);
       if (videoRef.current) {
         videoRef.current.srcObject = screenStream;
         videoRef.current.play().catch(() => {});
       }
       setHasRemoteVideoStream(true);
-      setLocalVideoName('Share Layar / Tab Host (Full HD 60fps)');
+      setLocalVideoName(`Share Layar / Tab Host (${fps}fps)`);
       pushStreamToConnectedGuest(screenStream, 'Tab / Layar Laptop Host');
     } catch {
       addSystemChat('Share layar dibatalkan oleh pengguna.');
@@ -870,173 +1351,30 @@ export default function App() {
     addSystemChat('Siaran live stream dihentikan.');
   };
 
-  // Loop Pemutaran & Koreksi Sinkronisasi 3 Zona Real-Time
+  // Loop Demo Ringan (HANYA berjalan saat tidak ada video asli/stream & tidak di-pause, di 4Hz)
   useEffect(() => {
+    if (!inRoom || !isPlaying || localVideoUrl || hasRemoteVideoStream) return;
+
     const interval = window.setInterval(() => {
-      if (!isPlaying && !localVideoUrl) return;
-
-      setHostTime((prevHost) => {
-        const nextHost = (prevHost + 0.05) % duration;
-        setClientTime((prevClient) => {
-          const delta = nextHost - prevClient;
-          const decision = evaluateThreeZoneCorrection(delta, isSoftCorrecting);
-          setIsSoftCorrecting(decision.isSoftCorrecting);
-
-          let nextClient = prevClient;
-          if (decision.zone === 'HARD_SEEK') {
-            nextClient = nextHost;
-          } else {
-            nextClient = (prevClient + 0.05 * decision.playbackRate) % duration;
-          }
-
-          if (videoRef.current && localVideoUrl) {
-            videoRef.current.playbackRate = decision.playbackRate;
-          }
-
-          const updatedDrift = nextHost - nextClient;
-          setTelemetry((prev) => ({
-            ...prev,
-            driftSeconds: Math.abs(updatedDrift) < 0.002 ? 0 : updatedDrift,
-            activePlaybackRate: decision.playbackRate,
-            zone: decision.zone,
-          }));
-
-          return nextClient;
-        });
-        return nextHost;
-      });
-    }, 50);
+      const nextHost = (hostTimeRef.current + 0.25) % duration;
+      hostTimeRef.current = nextHost;
+      clientTimeRef.current = nextHost;
+      setHostTime(nextHost);
+      setClientTime(nextHost);
+    }, 250);
 
     return () => window.clearInterval(interval);
-  }, [isPlaying, duration, isSoftCorrecting, localVideoUrl]);
-
-  // Render Kanvas Film Demo Interaktif (Layar Utama & Layar Kembar Pasangan)
-  useEffect(() => {
-    if (localVideoUrl) return;
-
-    const drawScene = (canvas: HTMLCanvasElement | null, timeSec: number, label: string) => {
-      if (!canvas) return;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-      const w = canvas.width;
-      const h = canvas.height;
-
-      const grad = ctx.createLinearGradient(0, 0, 0, h);
-      grad.addColorStop(0, '#070913');
-      grad.addColorStop(0.55, '#131629');
-      grad.addColorStop(1, '#09090B');
-      ctx.fillStyle = grad;
-      ctx.fillRect(0, 0, w, h);
-
-      // Bulan / Matahari Synthwave
-      const sunY = h * 0.4;
-      const sunGrad = ctx.createRadialGradient(w * 0.5, sunY, 10, w * 0.5, sunY, 85);
-      sunGrad.addColorStop(0, '#A5B4FC');
-      sunGrad.addColorStop(0.5, '#6366F1');
-      sunGrad.addColorStop(1, 'rgba(99, 102, 241, 0)');
-      ctx.fillStyle = sunGrad;
-      ctx.beginPath();
-      ctx.arc(w * 0.5, sunY, 85, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Bintang Berkelip
-      ctx.fillStyle = 'rgba(255,255,255,0.6)';
-      for (let s = 0; s < 18; s++) {
-        const sx = ((s * 97) % w);
-        const sy = ((s * 43) % (h * 0.45));
-        ctx.fillRect(sx, sy, 2, 2);
-      }
-
-      // Grid Perspektif Jalan
-      const horizonY = h * 0.56;
-      ctx.strokeStyle = 'rgba(99, 102, 241, 0.34)';
-      ctx.lineWidth = 1.2;
-
-      for (let i = -9; i <= 9; i++) {
-        ctx.beginPath();
-        ctx.moveTo(w * 0.5 + i * 18, horizonY);
-        ctx.lineTo(w * 0.5 + i * 105, h);
-        ctx.stroke();
-      }
-
-      const speedOffset = (timeSec * 2.4) % 1;
-      for (let row = 0; row < 9; row++) {
-        const p = (row + speedOffset) / 9;
-        const y = horizonY + Math.pow(p, 2.1) * (h - horizonY);
-        ctx.beginPath();
-        ctx.moveTo(0, y);
-        ctx.lineTo(w, y);
-        ctx.stroke();
-      }
-
-      // Badge Sudut Atas Kanvas
-      ctx.fillStyle = 'rgba(24, 24, 27, 0.82)';
-      ctx.fillRect(16, 16, 255, 34);
-      ctx.strokeStyle = 'rgba(99, 102, 241, 0.45)';
-      ctx.strokeRect(16, 16, 255, 34);
-      ctx.fillStyle = '#E4E4E7';
-      ctx.font = '600 12px sans-serif';
-      ctx.fillText(`${label} • ${timeSec.toFixed(2)} dtk`, 28, 37);
-    };
-
-    let animId: number;
-    const loop = () => {
-      drawScene(demoCanvasRef.current, hostTime, `Layar ${nickname} (${role})`);
-      if (showSplitGuestPreview) {
-        drawScene(
-          guestCanvasRef.current,
-          clientTime,
-          `Layar Pasangan (${telemetry.activePlaybackRate.toFixed(2)}x)`
-        );
-      }
-      animId = window.requestAnimationFrame(loop);
-    };
-    animId = window.requestAnimationFrame(loop);
-    return () => window.cancelAnimationFrame(animId);
-  }, [hostTime, clientTime, localVideoUrl, nickname, role, showSplitGuestPreview, telemetry.activePlaybackRate]);
-
-  // Loop Auto-Ducking (-30% Volume Film saat salah satu bicara)
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      let currentRms = 0.01;
-
-      if (liveMicListening && analyserRef.current) {
-        const buf = new Float32Array(analyserRef.current.fftSize);
-        analyserRef.current.getFloatTimeDomainData(buf);
-        let sum = 0;
-        for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
-        currentRms = Math.sqrt(sum / buf.length);
-      } else if (partnerSpeakingSim) {
-        currentRms = 0.13 + Math.sin(Date.now() / 90) * 0.04;
-      } else {
-        currentRms = 0.008 + Math.random() * 0.005;
-      }
-
-      setPartnerRms(currentRms);
-      const shouldDuck = autoDuckEnabled && currentRms >= 0.045;
-      setIsDucked(shouldDuck);
-
-      const targetVol = shouldDuck ? +(baseVolume * 0.7).toFixed(2) : baseVolume;
-      setEffectiveVolume((prev) => {
-        const step = shouldDuck ? 0.08 : 0.04;
-        const diff = targetVol - prev;
-        if (Math.abs(diff) < 0.01) return targetVol;
-        const next = +(prev + Math.sign(diff) * Math.min(Math.abs(diff), step)).toFixed(2);
-        if (videoRef.current) {
-          videoRef.current.volume = isVideoMuted ? 0 : next;
-        }
-        return next;
-      });
-    }, 50);
-
-    return () => window.clearInterval(timer);
-  }, [partnerSpeakingSim, liveMicListening, autoDuckEnabled, baseVolume, isVideoMuted]);
+  }, [inRoom, isPlaying, duration, localVideoUrl, hasRemoteVideoStream]);
 
   const toggleRealMicrophoneTest = async () => {
     if (liveMicListening) {
       micStreamRef.current?.getTracks().forEach((t) => t.stop());
-      audioContextRef.current?.close().catch(() => {});
+      micStreamRef.current = null;
+      activeVoiceCallRef.current?.close?.();
+      activeVoiceCallRef.current = null;
       setLiveMicListening(false);
+      setVoiceConnected(false);
+      setIsMicMuted(false);
       return;
     }
     try {
@@ -1047,22 +1385,33 @@ export default function App() {
           autoGainControl: true,
         },
       });
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      const ctx = new AudioCtx();
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 256;
-      const src = ctx.createMediaStreamSource(stream);
-      src.connect(analyser);
-
       micStreamRef.current = stream;
-      audioContextRef.current = ctx;
-      analyserRef.current = analyser;
       setLiveMicListening(true);
-      appendLog('AUTO_DUCK', 'Mikrofon aktif dengan Echo Cancellation & Auto-Ducking', telemetry.zone);
+      setIsMicMuted(false);
+
+      // Hubungkan voice call P2P ke pasangan jika sudah di dalam room
+      if (peerInstanceRef.current) {
+        if (roleRef.current === 'GUEST') {
+          const sanitizedId = activeRoomCode.replace(/[^A-Z0-9]/g, '');
+          placeVoiceCallToPeer(`synctheater-host-${sanitizedId}`);
+        } else if (connectedGuestPeerIdRef.current) {
+          placeVoiceCallToPeer(connectedGuestPeerIdRef.current);
+        }
+      }
+      appendLog('AUTO_DUCK', 'Mikrofon aktif dengan Echo Cancellation & Voice P2P siap', telemetry.zone);
     } catch {
       setPartnerSpeakingSim((prev) => !prev);
-      appendLog('AUTO_DUCK', 'Simulasi suara obrolan diaktifkan (volume film turun 30%)', telemetry.zone);
+      appendLog('AUTO_DUCK', 'Izin mikrofon tidak tersedia, simulasi auto-ducking diaktifkan', telemetry.zone);
     }
+  };
+
+  const toggleMicMute = () => {
+    if (!micStreamRef.current) return;
+    const nextMuted = !isMicMuted;
+    micStreamRef.current.getAudioTracks().forEach((t) => {
+      t.enabled = !nextMuted;
+    });
+    setIsMicMuted(nextMuted);
   };
 
   // Fungsi Kontrol Play/Pause & Seek yang Menyinkronkan Kedua Layar
@@ -1072,24 +1421,30 @@ export default function App() {
     setPlayActionFeedback(next ? 'PLAY' : 'PAUSE');
     window.setTimeout(() => setPlayActionFeedback(null), 650);
 
-    if (videoRef.current && (videoRef.current.src || videoRef.current.srcObject)) {
+    const vid = videoRef.current;
+    const currentVideoTime = vid && vid.src && !vid.srcObject ? vid.currentTime : clientTimeRef.current;
+
+    if (vid && (vid.src || vid.srcObject)) {
       if (next) {
-        videoRef.current.play().then(() => setAutoplayBlocked(false)).catch(() => setAutoplayBlocked(true));
+        vid.play().then(() => setAutoplayBlocked(false)).catch(() => setAutoplayBlocked(true));
       } else {
-        videoRef.current.pause();
+        vid.pause();
       }
     }
 
     broadcastRoomPacket({
       type: 'SYNC_ACTION',
       action: next ? 'PLAY' : 'PAUSE',
-      videoTime: clientTime,
+      videoTime: currentVideoTime,
+      sentAt: Date.now(),
     });
     appendLog(next ? 'PLAY' : 'PAUSE', `${nickname} menekan ${next ? 'Play' : 'Pause'}`, telemetry.zone);
   };
 
   const handleSeekTo = (newTime: number, reasonLabel?: string) => {
     const clamped = Math.max(0, Math.min(duration, newTime));
+    hostTimeRef.current = clamped;
+    clientTimeRef.current = clamped;
     setHostTime(clamped);
     setClientTime(clamped);
     if (videoRef.current && localVideoUrl) {
@@ -1099,6 +1454,7 @@ export default function App() {
       type: 'SYNC_ACTION',
       action: 'SEEK',
       videoTime: clamped,
+      sentAt: Date.now(),
     });
     appendLog('SEEK', reasonLabel || `Durasi digeser ke ${formatTime(clamped)}`, 'HARD_SEEK');
   };
@@ -1210,10 +1566,9 @@ export default function App() {
 
   const activeSubtitleCue =
     subtitlesEnabled &&
-    parsedCues.find((c) => (clientTime % 24) >= c.start && (clientTime % 24) <= c.end);
+    parsedCues.find((c) => clientTime >= c.start && clientTime <= c.end);
 
   const driftMs = Math.round(telemetry.driftSeconds * 1000);
-  const rmsBarWidth = Math.min(100, Math.round(partnerRms * 550));
 
   return (
     <div className="min-h-screen bg-[#09090B] text-zinc-100 flex flex-col font-sans">
@@ -1332,8 +1687,8 @@ export default function App() {
                         </label>
                         <input
                           type="text"
-                          value={nickname}
-                          onChange={(e) => setNickname(e.target.value)}
+                          value={hostNicknameInput}
+                          onChange={(e) => setHostNicknameInput(e.target.value)}
                           placeholder="Contoh: Surya"
                           className="w-full px-3.5 py-2 rounded-xl bg-zinc-900 border border-zinc-700 text-sm text-white focus:outline-none focus:border-indigo-500"
                         />
@@ -1383,8 +1738,7 @@ export default function App() {
                             onChange={(e) => {
                               const f = e.target.files?.[0];
                               if (f) {
-                                setLocalVideoUrl(URL.createObjectURL(f));
-                                setLocalVideoName(f.name);
+                                selectVideoSource(URL.createObjectURL(f), f.name);
                               }
                             }}
                           />
@@ -1395,7 +1749,7 @@ export default function App() {
 
                   <button
                     type="button"
-                    onClick={() => connectToRoom(roomCodeInput, 'HOST', nickname || 'Surya')}
+                    onClick={() => connectToRoom(roomCodeInput, 'HOST', hostNicknameInput.trim() || 'Surya')}
                     className="w-full py-3 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-sm shadow-lg shadow-indigo-600/25 transition flex items-center justify-center gap-2"
                   >
                     <span>Buat Room & Masuk Bioskop</span>
@@ -1429,8 +1783,8 @@ export default function App() {
                         </label>
                         <input
                           type="text"
-                           defaultValue="Adek"
-                          onChange={(e) => setNickname(e.target.value)}
+                          value={guestNicknameInput}
+                          onChange={(e) => setGuestNicknameInput(e.target.value)}
                           placeholder="Contoh: Adek"
                           className="w-full px-3.5 py-2 rounded-xl bg-zinc-900 border border-zinc-700 text-sm text-white focus:outline-none focus:border-emerald-500"
                         />
@@ -1462,7 +1816,7 @@ export default function App() {
 
                   <button
                     type="button"
-                    onClick={() => connectToRoom(joinCodeInput, 'GUEST', nickname === 'Surya' ? 'Adek' : nickname)}
+                    onClick={() => connectToRoom(joinCodeInput, 'GUEST', guestNicknameInput.trim() || 'Adek')}
                     className="w-full py-3 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-sm shadow-lg shadow-emerald-600/25 transition flex items-center justify-center gap-2"
                   >
                     <span>Gabung ke Room Sekarang</span>
@@ -1537,7 +1891,15 @@ export default function App() {
                   </div>
 
                   <div className="flex items-center gap-2 text-xs text-zinc-300">
-                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
+                    <span
+                      className={`w-2.5 h-2.5 rounded-full ${
+                        p2pStatus === 'ERROR'
+                          ? 'bg-rose-500'
+                          : p2pStatus === 'CONNECTING'
+                          ? 'bg-amber-400 animate-pulse'
+                          : 'bg-emerald-400 animate-pulse'
+                      }`}
+                    />
                     <span>
                       Masuk sebagai <strong>{nickname} ({role})</strong> • {connectedPartnerName}
                     </span>
@@ -1574,7 +1936,7 @@ export default function App() {
 
                   <button
                     type="button"
-                    onClick={() => setInRoom(false)}
+                    onClick={leaveRoom}
                     className="px-3 py-1.5 rounded-xl bg-zinc-900 hover:bg-rose-500/20 border border-zinc-700 hover:border-rose-500/40 text-zinc-300 hover:text-rose-300 text-xs font-medium transition flex items-center gap-1"
                   >
                     <LogOut className="w-3.5 h-3.5" />
@@ -1582,6 +1944,22 @@ export default function App() {
                   </button>
                 </div>
               </div>
+
+              {peerErrorMsg && (
+                <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-2.5 text-xs text-rose-200 flex items-center justify-between">
+                  <span>⚠️ {peerErrorMsg}</span>
+                  <button
+                    type="button"
+                    onClick={() => connectToRoom(activeRoomCode, role, nickname)}
+                    className="px-2.5 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-semibold text-[11px]"
+                  >
+                    Coba Hubungkan Ulang
+                  </button>
+                </div>
+              )}
+
+              {/* Audio tersembunyi untuk menerima suara Voice Chat P2P pasangan */}
+              <audio ref={remoteVoiceAudioRef} autoPlay playsInline className="hidden" />
 
               {/* Grid Bioskop: Layar Video (Kiri) + Voice & Chat Pasangan (Kanan) */}
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
@@ -1608,8 +1986,11 @@ export default function App() {
                           playsInline
                           onTimeUpdate={() => {
                             if (videoRef.current) {
-                              setClientTime(videoRef.current.currentTime);
-                              setHostTime(videoRef.current.currentTime);
+                              const t = videoRef.current.currentTime;
+                              clientTimeRef.current = t;
+                              hostTimeRef.current = t;
+                              setClientTime(t);
+                              setHostTime(t);
                             }
                           }}
                           onLoadedMetadata={() => {
@@ -1621,22 +2002,13 @@ export default function App() {
                               setDuration(videoRef.current.duration);
                             }
                           }}
-                        >
-                          {vttBlobUrl && subtitlesEnabled && (
-                            <track
-                              kind="subtitles"
-                              src={vttBlobUrl}
-                              srcLang="id"
-                              label="Indonesia"
-                              default
-                            />
-                          )}
-                        </video>
+                        />
                       ) : (
-                        <canvas
-                          ref={demoCanvasRef}
-                          width={960}
-                          height={540}
+                        <DemoCanvas
+                          canvasRef={demoCanvasRef}
+                          timeRef={hostTimeRef}
+                          isPlaying={isPlaying}
+                          label={`Layar ${nickname} (${role})`}
                           onClick={handleTogglePlayPause}
                           className="w-full h-full object-cover cursor-pointer"
                         />
@@ -1847,10 +2219,11 @@ export default function App() {
                     {/* LAYAR 2 (OPSIONAL): SIMULASI LAYAR PASANGAN BERDAMPINGAN */}
                     {showSplitGuestPreview && (
                       <div className="relative w-full aspect-video rounded-2xl overflow-hidden bg-black border-2 border-amber-500/50 shadow-2xl flex flex-col justify-between">
-                        <canvas
-                          ref={guestCanvasRef}
-                          width={960}
-                          height={540}
+                        <DemoCanvas
+                          canvasRef={guestCanvasRef}
+                          timeRef={clientTimeRef}
+                          isPlaying={isPlaying}
+                          label={`Layar Pasangan (${telemetry.activePlaybackRate.toFixed(2)}x)`}
                           className="w-full h-full object-cover"
                         />
                         {activeSubtitleCue && (
@@ -1904,7 +2277,15 @@ export default function App() {
                           title="Atur Bitrate WebRTC (4-5 Mbps) & Mode Anti-Burik"
                         >
                           <Zap className="w-3.5 h-3.5 text-amber-400" />
-                          <span>{(streamBitrateKbps / 1000).toFixed(1)} Mbps ({streamQualityMode === 'SHARP' ? 'Anti-Burik' : '60 FPS'})</span>
+                          <span>
+                            {(streamBitrateKbps / 1000).toFixed(1)} Mbps (
+                            {streamQualityMode === 'BALANCED'
+                              ? 'Anti-Lag'
+                              : streamQualityMode === 'SHARP'
+                              ? 'Anti-Burik'
+                              : '60 FPS'}
+                            )
+                          </span>
                           <Sliders className="w-3 h-3 opacity-60" />
                         </button>
 
@@ -1930,10 +2311,10 @@ export default function App() {
                               </label>
                               <div className="grid grid-cols-2 gap-1.5">
                                 {[
-                                  { label: '5.0 Mbps (Rekomendasi)', kbps: 5000, desc: 'Full HD Tajam & Halus' },
-                                  { label: '4.0 Mbps (Lancar)', kbps: 4000, desc: 'Stabil 1080p' },
-                                  { label: '2.5 Mbps (Hemat)', kbps: 2500, desc: 'Untuk Kuota Terbatas' },
-                                  { label: '8.0 Mbps (Ultra HD)', kbps: 8000, desc: 'Kualitas Bioskop Max' },
+                                  { label: '3.0 Mbps (Anti-Lag)', kbps: 3000, desc: 'Rekomendasi Lancar 30fps' },
+                                  { label: '5.0 Mbps (Tajam)', kbps: 5000, desc: 'Full HD Wi-Fi Cepat' },
+                                  { label: '1.8 Mbps (Hemat)', kbps: 1800, desc: 'Untuk Jaringan Seluler' },
+                                  { label: '8.0 Mbps (Ultra)', kbps: 8000, desc: 'Kualitas Max LAN/Fiber' },
                                 ].map((item) => (
                                   <button
                                     key={item.kbps}
@@ -1954,9 +2335,21 @@ export default function App() {
 
                             <div className="space-y-1.5">
                               <label className="text-[11px] font-medium text-zinc-400">
-                                Prioritas Mode Degradasi (Anti-Burik):
+                                Prioritas Mode Degradasi:
                               </label>
-                              <div className="grid grid-cols-2 gap-1.5">
+                              <div className="grid grid-cols-3 gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() => changeQualityMode('BALANCED')}
+                                  className={`p-2 rounded-xl text-left border transition ${
+                                    streamQualityMode === 'BALANCED'
+                                      ? 'bg-emerald-600/25 border-emerald-500/60 text-emerald-200 font-semibold'
+                                      : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                                  }`}
+                                >
+                                  <div className="text-[11px] font-bold">⚡ Anti-Lag</div>
+                                  <div className="text-[10px] text-zinc-400">Adaptif 30fps</div>
+                                </button>
                                 <button
                                   type="button"
                                   onClick={() => changeQualityMode('SHARP')}
@@ -1966,26 +2359,26 @@ export default function App() {
                                       : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
                                   }`}
                                 >
-                                  <div className="text-[11px] font-bold">🎬 Resolusi Tajam</div>
-                                  <div className="text-[10px] text-zinc-400">Kunci 1080p, tolak burik</div>
+                                  <div className="text-[11px] font-bold">🎬 Tajam</div>
+                                  <div className="text-[10px] text-zinc-400">Kunci 1080p</div>
                                 </button>
                                 <button
                                   type="button"
                                   onClick={() => changeQualityMode('MOTION')}
                                   className={`p-2 rounded-xl text-left border transition ${
                                     streamQualityMode === 'MOTION'
-                                      ? 'bg-emerald-600/25 border-emerald-500/60 text-emerald-200 font-semibold'
+                                      ? 'bg-amber-600/25 border-amber-500/60 text-amber-200 font-semibold'
                                       : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
                                   }`}
                                 >
-                                  <div className="text-[11px] font-bold">🏃 Gerakan 60 FPS</div>
-                                  <div className="text-[10px] text-zinc-400">Prioritaskan kehalusan</div>
+                                  <div className="text-[11px] font-bold">🏃 60 FPS</div>
+                                  <div className="text-[10px] text-zinc-400">Super mulus</div>
                                 </button>
                               </div>
                             </div>
 
                             <div className="p-2.5 rounded-xl bg-zinc-950 border border-zinc-850 text-[10px] text-zinc-400 leading-relaxed">
-                              💡 <strong>Tips Anti-Lag:</strong> Bitrate 4-5 Mbps dipadukan dengan Jitter Buffer 180ms menjamin video 1080p tetap jernih tanpa macet di jaringan Wi-Fi.
+                              💡 <strong>Tips Anti-Lag:</strong> Mode <strong>Anti-Lag (3.0 Mbps / 30fps)</strong> jauh lebih ringan di CPU & Wi-Fi. Jika punya file film yang sama di kedua perangkat, pakai <strong>Pilih File .MP4</strong> agar kualitas 100% asli 0 lag!
                             </div>
                           </div>
                         )}
@@ -2035,8 +2428,7 @@ export default function App() {
                           onChange={(e) => {
                             const f = e.target.files?.[0];
                             if (f) {
-                              setLocalVideoUrl(URL.createObjectURL(f));
-                              setLocalVideoName(f.name);
+                              selectVideoSource(URL.createObjectURL(f), f.name);
                               addSystemChat(`${nickname} mengganti film ke: ${f.name}`);
                             }
                           }}
@@ -2074,13 +2466,21 @@ export default function App() {
                   <div className="rounded-2xl border border-zinc-800 bg-[#18181B] p-4 space-y-3.5">
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-2">
-                        <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
+                        <span
+                          className={`w-2.5 h-2.5 rounded-full ${
+                            voiceConnected
+                              ? 'bg-emerald-400 animate-pulse'
+                              : liveMicListening
+                              ? 'bg-amber-400 animate-pulse'
+                              : 'bg-zinc-600'
+                          }`}
+                        />
                         <h3 className="text-xs font-bold uppercase tracking-wider text-zinc-200">
                           Voice Chat & Auto-Ducking
                         </h3>
                       </div>
                       <span className="text-[11px] text-emerald-400 font-medium">
-                        Anti-Gema Aktif
+                        {voiceConnected ? 'Voice P2P Terhubung' : 'Anti-Gema Aktif'}
                       </span>
                     </div>
 
@@ -2094,33 +2494,39 @@ export default function App() {
                             : 'border-indigo-500/40 bg-indigo-600 hover:bg-indigo-500 text-white'
                         }`}
                       >
-                        {liveMicListening ? (
-                          <>
-                            <Mic className="w-4 h-4" />
-                            <span>Mic Laptop Aktif</span>
-                          </>
-                        ) : (
-                          <>
-                            <Mic className="w-4 h-4" />
-                            <span>Aktifkan Mic Saya</span>
-                          </>
-                        )}
+                        <Mic className="w-4 h-4" />
+                        <span>{liveMicListening ? 'Matikan Mic' : 'Aktifkan Mic Saya'}</span>
                       </button>
 
-                      <button
-                        type="button"
-                        onClick={() => setPartnerSpeakingSim((s) => !s)}
-                        className={`py-2.5 px-3 rounded-xl border text-xs font-semibold transition flex items-center justify-center gap-1.5 ${
-                          partnerSpeakingSim
-                            ? 'border-amber-500 bg-amber-500/20 text-amber-300'
-                            : 'border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-zinc-200'
-                        }`}
-                      >
-                        <Radio className="w-4 h-4" />
-                        <span>
-                          {partnerSpeakingSim ? 'Pasangan Bicara...' : 'Coba Efek Ngobrol'}
-                        </span>
-                      </button>
+                      {liveMicListening ? (
+                        <button
+                          type="button"
+                          onClick={toggleMicMute}
+                          className={`py-2.5 px-3 rounded-xl border text-xs font-semibold transition flex items-center justify-center gap-1.5 ${
+                            isMicMuted
+                              ? 'border-rose-500 bg-rose-500/20 text-rose-200'
+                              : 'border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-zinc-200'
+                          }`}
+                        >
+                          {isMicMuted ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
+                          <span>{isMicMuted ? 'Mic Di-Mute' : 'Mute Mic'}</span>
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setPartnerSpeakingSim((s) => !s)}
+                          className={`py-2.5 px-3 rounded-xl border text-xs font-semibold transition flex items-center justify-center gap-1.5 ${
+                            partnerSpeakingSim
+                              ? 'border-amber-500 bg-amber-500/20 text-amber-300'
+                              : 'border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-zinc-200'
+                          }`}
+                        >
+                          <Radio className="w-4 h-4" />
+                          <span>
+                            {partnerSpeakingSim ? 'Pasangan Bicara...' : 'Coba Efek Ngobrol'}
+                          </span>
+                        </button>
+                      )}
                     </div>
 
                     <div className="flex items-center justify-between pt-1">
@@ -2142,7 +2548,7 @@ export default function App() {
 
                     <div className="space-y-1">
                       <div className="flex items-center justify-between text-[11px]">
-                        <span className="text-zinc-400">Indikator Suara Masuk:</span>
+                        <span className="text-zinc-400">Indikator Suara Pasangan:</span>
                         <span
                           className={`font-mono font-semibold ${
                             isDucked ? 'text-amber-400' : 'text-emerald-400'
@@ -2153,10 +2559,11 @@ export default function App() {
                       </div>
                       <div className="w-full h-2 rounded-full bg-zinc-900 overflow-hidden border border-zinc-800">
                         <div
+                          ref={rmsBarRef}
                           className={`h-full transition-all duration-75 ${
                             isDucked ? 'bg-amber-400' : 'bg-indigo-500'
                           }`}
-                          style={{ width: `${rmsBarWidth}%` }}
+                          style={{ width: '0%' }}
                         />
                       </div>
                     </div>
@@ -2541,6 +2948,38 @@ cd ../backend && go mod tidy && go build -o ../nobar.exe .`}
             </div>
 
             <div className="space-y-3">
+              {serverMovies.length > 0 && (
+                <div className="space-y-1.5">
+                  <div className="text-[11px] font-semibold text-emerald-400">
+                    Film di Server Lokal Go (HTTP 206 Anti-Lag):
+                  </div>
+                  <div className="max-h-32 overflow-y-auto space-y-1 pr-1">
+                    {serverMovies.map((m) => (
+                      <button
+                        key={m.name}
+                        type="button"
+                        onClick={() => {
+                          selectVideoSource(m.streamUrl, m.name);
+                          broadcastRoomPacket({
+                            type: 'SYNC_ACTION',
+                            action: 'MEDIA_CHANGE',
+                            mediaSource: m.streamUrl,
+                            mediaName: m.name,
+                          });
+                          setShowMediaModal(false);
+                        }}
+                        className="w-full flex items-center justify-between px-3 py-2 rounded-xl bg-zinc-900 hover:bg-indigo-600/20 border border-zinc-800 text-left text-xs transition"
+                      >
+                        <span className="truncate font-medium text-zinc-200">{m.name}</span>
+                        <span className="text-[10px] text-zinc-400 ml-2 shrink-0">
+                          {(m.size / (1024 * 1024)).toFixed(0)} MB
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               <label className="cursor-pointer flex items-center justify-center gap-2 w-full py-3 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white transition">
                 <Film className="w-4 h-4" />
                 <span>Pilih File Video (.MP4 / .WebM) dari Laptop/HP</span>
@@ -2551,8 +2990,7 @@ cd ../backend && go mod tidy && go build -o ../nobar.exe .`}
                   onChange={(e) => {
                     const f = e.target.files?.[0];
                     if (f) {
-                      setLocalVideoUrl(URL.createObjectURL(f));
-                      setLocalVideoName(f.name);
+                      selectVideoSource(URL.createObjectURL(f), f.name);
                       setShowMediaModal(false);
                     }
                   }}
@@ -2563,8 +3001,14 @@ cd ../backend && go mod tidy && go build -o ../nobar.exe .`}
                 onSubmit={(e) => {
                   e.preventDefault();
                   if (externalUrlInput.trim()) {
-                    setLocalVideoUrl(externalUrlInput.trim());
-                    setLocalVideoName(externalUrlInput.trim());
+                    const url = externalUrlInput.trim();
+                    selectVideoSource(url, url);
+                    broadcastRoomPacket({
+                      type: 'SYNC_ACTION',
+                      action: 'MEDIA_CHANGE',
+                      mediaSource: url,
+                      mediaName: url,
+                    });
                     setShowMediaModal(false);
                   }
                 }}

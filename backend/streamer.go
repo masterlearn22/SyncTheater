@@ -29,16 +29,16 @@ func (vs *VideoStreamer) ServeVideo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Sanitasi nama file menggunakan filepath.Clean untuk mencegah directory traversal
+	// Sanitasi nama file menggunakan filepath.Clean & filepath.Rel untuk mencegah directory traversal
 	cleanRel := filepath.Clean(rawFile)
-	if strings.Contains(cleanRel, "..") || filepath.IsAbs(cleanRel) {
+	if cleanRel == "." || cleanRel == ".." || strings.HasPrefix(cleanRel, ".."+string(filepath.Separator)) || filepath.IsAbs(cleanRel) {
 		http.Error(w, "Akses ditolak: Path tidak valid", http.StatusForbidden)
 		return
 	}
 
 	targetPath := filepath.Join(vs.BaseDir, cleanRel)
 	relCheck, err := filepath.Rel(vs.BaseDir, targetPath)
-	if err != nil || strings.HasPrefix(relCheck, "..") {
+	if err != nil || relCheck == "." || relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(filepath.Separator)) {
 		http.Error(w, "Akses di luar folder media ditolak", http.StatusForbidden)
 		return
 	}

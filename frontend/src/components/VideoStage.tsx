@@ -57,6 +57,21 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     }, 3000);
   };
 
+  const callbacksRef = useRef({
+    onUserPlay,
+    onUserPause,
+    onUserSeek,
+    onVolumeChange,
+    onToggleMicShortcut,
+  });
+  callbacksRef.current = {
+    onUserPlay,
+    onUserPause,
+    onUserSeek,
+    onVolumeChange,
+    onToggleMicShortcut,
+  };
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
@@ -70,23 +85,23 @@ export const VideoStage: React.FC<VideoStageProps> = ({
           e.preventDefault();
           if (vid.paused) {
             vid.play().catch(() => {});
-            onUserPlay();
+            callbacksRef.current.onUserPlay();
           } else {
             vid.pause();
-            onUserPause();
+            callbacksRef.current.onUserPause();
           }
           resetHudTimer();
           break;
         case 'ArrowLeft':
           e.preventDefault();
           vid.currentTime = Math.max(0, vid.currentTime - 5);
-          onUserSeek(vid.currentTime);
+          callbacksRef.current.onUserSeek(vid.currentTime);
           resetHudTimer();
           break;
         case 'ArrowRight':
           e.preventDefault();
           vid.currentTime = Math.min(vid.duration || 0, vid.currentTime + 5);
-          onUserSeek(vid.currentTime);
+          callbacksRef.current.onUserSeek(vid.currentTime);
           resetHudTimer();
           break;
         case 'ArrowUp':
@@ -95,7 +110,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
             const nextVol = Math.min(1, +(vid.volume + 0.05).toFixed(2));
             vid.volume = nextVol;
             setVolume(nextVol);
-            onVolumeChange(nextVol);
+            callbacksRef.current.onVolumeChange(nextVol);
             resetHudTimer();
           }
           break;
@@ -105,13 +120,13 @@ export const VideoStage: React.FC<VideoStageProps> = ({
             const nextVol = Math.max(0, +(vid.volume - 0.05).toFixed(2));
             vid.volume = nextVol;
             setVolume(nextVol);
-            onVolumeChange(nextVol);
+            callbacksRef.current.onVolumeChange(nextVol);
             resetHudTimer();
           }
           break;
         case 'KeyM':
           e.preventDefault();
-          onToggleMicShortcut();
+          callbacksRef.current.onToggleMicShortcut();
           resetHudTimer();
           break;
         case 'KeyF':
@@ -123,7 +138,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  });
+  }, [videoRef]);
 
   const toggleFullscreen = () => {
     if (!containerRef.current) return;
